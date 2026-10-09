@@ -87,7 +87,7 @@ def test_strip_language_tag(stem, expected):
 
 
 def test_default_output_name():
-    assert st.default_output_name(r"C:\x\Movie.en.srt", "pt-BR") == "Movie.pt-BR.srt"
+    assert st.default_output_name(str(pathlib.Path("x") / "Movie.en.srt"), "pt-BR") == "Movie.pt-BR.srt"
 
 
 # ── Cues, tags, passthrough ──────────────────────────────────────────
@@ -140,7 +140,7 @@ def test_glossary_violations():
 
 
 def test_sidecar_path():
-    assert st.glossary_sidecar_path(r"C:\x\Movie.en.srt").name == "Movie.names.txt"
+    assert st.glossary_sidecar_path(str(pathlib.Path("x") / "Movie.en.srt")).name == "Movie.names.txt"
 
 
 # ── Models & pricing ─────────────────────────────────────────────────
