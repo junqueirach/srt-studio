@@ -16,7 +16,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install test tools
-        run: pip install pytest jsonschema
+      - name: Install tkinter (needed by the GUI module the tests import)
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - name: Install dependencies and test tools
+        run: pip install -r requirements.txt pytest jsonschema
       - name: Run tests
         run: python -m pytest tests -v

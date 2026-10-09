@@ -2,11 +2,11 @@
 
 **Translate `.srt` subtitle files while keeping timing and structure intact.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/Python-3.9%2B-blue) [![CI](https://github.com/junqueirach/srt-translator/actions/workflows/ci.yml/badge.svg)](https://github.com/junqueirach/srt-translator/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/Python-3.9%2B-blue) [![CI](https://github.com/junqueirach/srt-translator/actions/workflows/ci.yml/badge.svg)](https://github.com/junqueirach/srt-translator/actions/workflows/ci.yml) ![Version](https://img.shields.io/badge/version-0.7.0-brightgreen)
 
 <p align="center"><img src="docs/screenshots/srt-translator.png" alt="SRT Translator screenshot" width="900"></p>
 
-**Download for Windows:** get the ready-to-run `.exe` from the [latest release](https://github.com/junqueirach/srt-translator/releases/latest). No Python needed.
+**Download for Windows:** get `SRT-Translator-0.7.0-win64.zip` (about 26 MB) from the [latest release](https://github.com/junqueirach/srt-translator/releases/latest). Unzip it, open the `SRT Translator` folder and double-click `SRT Translator.exe`. No Python needed. The SHA-256 checksum is in the release notes. For the Claude engine you need your own API key (see Quick start).
 
 > **Windows SmartScreen:** the file is not code-signed, so Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**. You can also run the app from source (see Quick start) and read every line of the code first.
 
@@ -14,14 +14,24 @@
 
 <p align="center"><img src="docs/screenshots/how-it-works.png" alt="How it works" width="900"></p>
 
+1. Load a `.srt` file (drag and drop or Browse). Encoding and language are detected.
+2. Pick the target language, the engine and, for Claude, the model.
+3. Check the cost estimate, optionally run a 20-block **Sample**.
+4. Press **Start**. Blocks are translated in parallel batches, checked, repaired if needed and saved as `Movie.pt-BR.srt`.
+
 ## What it does
 
 - Two engines: **Claude API** (best quality, bring your own key) and **MyMemory** (free, for testing)
-- **Structure-preserving**: cue numbers and timestamps are never touched, only text is translated
-- Optional **context file**: a reference subtitle in another language that helps Claude understand the dialogue
-- Drag-and-drop loading, encoding detection, output folder memory
-- Live **cost estimate** from token count and current pricing
-- Concurrent requests with progress and error handling
+- **Structure-preserving**: cue numbers, timestamps and line counts are never touched, only text is translated
+- **Live model list** read from the Anthropic API, newest first, cached for offline use
+- **Live pricing** from Anthropic's published pricing page, refreshed daily, plus a local `pricing.json` override
+- **Exact cost estimate** using the free `count_tokens` endpoint, and the **real cost** of every run from the API usage
+- **Hearing-impaired cues** such as `[door slams]`, `(laughs)` and `APPLAUSE` are translated in their original style (optional)
+- **Quality control**: every block is verified after the run; unchanged or lost lines are retranslated automatically and a QC report is shown
+- **Name preservation**: a list of people, places and institutions that must stay as written, with an auto-detect button
+- Optional **context file**: the same film in another language, sent by time window to help with ambiguous dialogue
+- Formatting tags (`<i>`, `<b>`, `{\an8}`) are protected during translation
+- Drag-and-drop loading, encoding detection, output folder memory, parallel requests with retry
 
 ## Quick start
 
@@ -29,13 +39,79 @@
 python srt_translator.py
 ```
 
-The first run installs `requests` if it is missing. Your API key is kept in a local config file in your home folder, never in this repository.
+The first run offers to install the two packages the app needs (`requests` and `anthropic`) if they are missing. Or install them yourself:
+
+```
+pip install -r requirements.txt
+```
+
+Optional: `pip install tkinterdnd2` enables drag and drop.
+
+For the Claude engine you need an API key from [console.anthropic.com](https://console.anthropic.com). Enter it with the **Edit** button or set the `ANTHROPIC_API_KEY` environment variable. The key is kept in `~/.srt_translator_config.json`, outside this repository, and is sent only to `api.anthropic.com`.
+
+## Using the app
+
+| Step | What to do |
+|---|---|
+| Source file | Drop the `.srt` on the first box. The block count, encoding and number of cue lines are shown. |
+| Context file | Optional. A subtitle of the same film in another language. Only the lines around each batch, by timestamp, are sent to Claude. |
+| Output | Tick *Save in same folder* to skip the Save dialog. The name is the source name without its language tag, plus the target code: `Movie.en.srt` becomes `Movie.pt-BR.srt`. |
+| Languages | The source language is detected from the text; adjust if wrong. The target language is remembered. |
+| Engine and model | Claude is recommended. The model list comes from the API; `★ recommended` marks the cheapest current model. Press ↻ to refresh models and prices. |
+| Estimated cost | Shown as soon as a file is loaded. Press **↻ exact** to count the real input tokens. The real cost of each run is written in the Activity Log. |
+| Preserve names | One name per line. **Auto-detect names** asks Claude to list people, places and institutions found in the file; review the list before starting. A `Movie.names.txt` next to the subtitle is loaded automatically and can be saved with **Save next to SRT**. |
+| Sample | Translates the first 20 blocks, shows them in the Comparison tab with the real cost, saves nothing. |
+| Start | Translates everything, runs quality control, saves the file and verifies its structure. |
+
+## Quality control
+
+After every run each block is compared with its source:
+
+- text identical to the source (likely untranslated)
+- missing or empty lines, lost formatting tags
+- names from the preserve list that disappeared
+
+Blocks with the first two kinds of problem are sent back to Claude once, in small groups. Whatever remains is listed in the Activity Log and highlighted in the Comparison tab. A batch whose output was cut off by the token limit is split in half and retried automatically.
+
+## Models and pricing
+
+The app does not hardcode the model list. On start, and whenever you press ↻, it reads `GET /v1/models` and shows every current Claude model with its context size. The list is cached in the config file so the app also opens offline.
+
+Prices are resolved in this order:
+
+1. `pricing.json` next to the app, if present (see `pricing.example.json`)
+2. the official pricing page, downloaded once a day and cached
+3. a built-in table, used only when both fail
+
+`pricing.json` format, prices in dollars per million tokens, keys are model family and version:
+
+```json
+{
+  "haiku 5.5":  {"input": 0.10, "output": 0.50},
+  "sonnet 5.5": {"input": 2.00, "output": 10.00}
+}
+```
+
+Typical cost, measured on a 903-block, 90-minute documentary translated to Brazilian Portuguese with Claude Haiku 5.5: about two cents. Thinking is turned off, or effort set to low, on every model so no reasoning tokens are billed.
+
+## Hearing-impaired subtitles
+
+Cue lines written as `[door slams]`, `(laughs)` or `APPLAUSE` are translated and keep their bracket or capital style. Untick *Translate hearing-impaired cues* to leave them untouched. Lines made only of punctuation, numbers or music notes are never sent for translation.
+
+## Development
+
+```
+pip install -r requirements.txt pytest
+python -m pytest tests -v
+```
+
+`tests/test_core.py` covers parsing, naming, cues, tags, the glossary, the pricing parser, the cost estimate, the batch protocol with a fake client, and quality control. No API key or network is needed.
 
 ## Project facts
 
-- Built in small steps, from a command-line script (`archive/versions/srt_translator R0 (no GUI).py`) to the GUI in v0.6.0
+- Built in small steps, from a command-line script (`archive/versions/srt_translator R0 (no GUI).py`) to the GUI in v0.6.0 and the quality-control release v0.7.0
 - `web-prototype/` holds an early React version of the interface
-- Open items are in [docs/todo.txt](docs/todo.txt)
+- Changes per version are in [CHANGELOG.md](CHANGELOG.md)
 
 ---
 

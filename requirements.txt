@@ -1,0 +1,6 @@
+# Runtime dependencies (the app offers to install these on first run)
+requests>=2.28
+anthropic>=0.100,<2
+
+# Optional: drag-and-drop support in the GUI
+# tkinterdnd2>=0.4

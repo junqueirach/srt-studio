@@ -28,3 +28,9 @@ __pycache__/
 *.srt
 *.vtt
 *.wav
+
+# Release assets are uploaded on GitHub, never committed
+release/
+*.zip
+*.exe
+pricing.json

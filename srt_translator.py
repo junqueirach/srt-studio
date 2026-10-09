@@ -1,48 +1,130 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════╗
-║       SRT Subtitle Translator  v0.6.0 — Desktop GUI       ║
+║       SRT Subtitle Translator  v0.7.0 — Desktop GUI       ║
 ║                                                           ║
 ║  Structure-preserving subtitle translation for .srt files ║
 ║  Engines: Claude API · MyMemory (free)                    ║
 ║  Author:  Luiz Junqueira & Claude AI                      ║
 ╚═══════════════════════════════════════════════════════════╝
 
-v0.6.0 changes:
-  • Drag-and-drop file loading for source and context files
-  • Output folder memory — Save dialog reopens in last-used folder
-  • "Same folder as source" checkbox — skip the dialog entirely
-  • Context file support (Claude API only) — optional reference SRT
-    in another language to help Claude understand dialogue meaning
-  • Encoding info shown in file info line after load
-  • Estimated cost panel with live token estimate, fetches current
-    pricing from Anthropic docs API; falls back to hardcoded rates
+v0.7.0 changes:
+  • Live model list from the Anthropic API (newest first, cached offline)
+  • Live pricing from Anthropic's published pricing page, refreshed daily,
+    with a pricing.json override and a built-in fallback table
+  • Exact input-token count (count_tokens endpoint) for the estimate and
+    real cost reported after each run from the API usage figures
+  • Hearing-impaired cues ([brackets], (parentheses), ALL CAPS) are now
+    translated; a checkbox turns this off
+  • Structured JSON protocol: one entry per line, enforced by the API's
+    JSON-schema output, so lines can no longer be merged, split or lost
+  • Quality control pass: unchanged blocks are detected and retranslated,
+    cut-off batches are split and retried, a QC report is logged
+  • "Preserve names" list (UI + optional <file>.names.txt sidecar) and
+    an auto-detect button that extracts people/places/institutions
+  • Context file sent by time window (only the lines around each batch)
+    with prompt caching on the fixed prompt
+  • Formatting tags (<i>, <b>, {\\an8}) protected with placeholders
+  • Sample run: translate the first 20 blocks to judge quality and cost
+  • Output name without the source language tag (Movie.pt-BR.srt)
+  • Fast cancel, local mouse wheel, empty blocks kept, invalid saved
+    model falls back, dependencies installed on demand with a dialog
+  • Claude calls use the official anthropic SDK (auto-retry, typed errors)
 """
+
+import concurrent.futures
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-import threading
-import concurrent.futures
-import re
-import time
-import os
-import json
-from pathlib import Path
-
-try:
-    import requests
-except ImportError:
-    import subprocess, sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-    import requests
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # VERSION
 # ═══════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v0.6.0"
+APP_VERSION = "v0.7.0"
 APP_TITLE   = f"SRT Subtitle Translator  {APP_VERSION}"
+IS_FROZEN   = bool(getattr(sys, "frozen", False))
+APP_DIR     = Path(sys.executable).parent if IS_FROZEN else Path(__file__).resolve().parent
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DEPENDENCIES  —  imported lazily, installed on demand (never at import)
+# ═══════════════════════════════════════════════════════════════════════
+
+REQUIRED_PACKAGES = [
+    # (import name, pip name, why)
+    ("requests",  "requests",  "MyMemory engine and pricing download"),
+    ("anthropic", "anthropic", "Claude API engine"),
+]
+
+
+def _try_import(name):
+    try:
+        return __import__(name)
+    except ImportError:
+        return None
+
+
+def _pip_install(pip_name: str) -> tuple[bool, str]:
+    """Install a package with the running interpreter's pip. Returns (ok, output)."""
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", pip_name]
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                              creationflags=flags)
+        return proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]
+    except Exception as e:  # pragma: no cover - environment specific
+        return False, str(e)
+
+
+def ensure_dependencies(parent=None) -> list:
+    """
+    Check the optional packages. Ask the user before installing anything.
+    Returns the list of import names that are still missing afterwards.
+    Inside a frozen .exe nothing can be installed; the exe bundles them.
+    """
+    missing = [(imp, pip, why) for imp, pip, why in REQUIRED_PACKAGES if _try_import(imp) is None]
+    if not missing or IS_FROZEN:
+        return [m[0] for m in missing]
+    names = ", ".join(pip for _, pip, _ in missing)
+    ok = messagebox.askyesno(
+        "Install dependencies",
+        f"{APP_TITLE} needs these Python packages:\n\n"
+        + "\n".join(f"  • {pip}  ({why})" for _, pip, why in missing)
+        + f"\n\nInstall now with pip?  (python -m pip install {names})",
+        parent=parent)
+    if not ok:
+        return [m[0] for m in missing]
+    still = []
+    for imp, pip, _ in missing:
+        done, out = _pip_install(pip)
+        if not done or _try_import(imp) is None:
+            still.append(imp)
+            messagebox.showerror("Install failed",
+                                 f"Could not install '{pip}'.\n\n{out}\n\n"
+                                 f"Try manually:  python -m pip install {pip}", parent=parent)
+    return still
+
+
+def _anthropic():
+    import anthropic  # noqa: F401  (lazy so the module imports without it)
+    return anthropic
+
+
+def _requests():
+    import requests  # noqa: F401
+    return requests
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -51,20 +133,22 @@ APP_TITLE   = f"SRT Subtitle Translator  {APP_VERSION}"
 
 CONFIG_PATH = Path.home() / ".srt_translator_config.json"
 
+
 def load_config() -> dict:
     try:
         if CONFIG_PATH.exists():
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception:
         pass
     return {}
 
+
 def save_config(data: dict):
     try:
         existing = load_config()
         existing.update(data)
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(existing, f, indent=2)
     except Exception:
         pass
@@ -80,7 +164,6 @@ COLORS = {
     "bg_card":      "#1c2333",
     "bg_input":     "#0d1117",
     "border":       "#30363d",
-    "border_focus": "#58a6ff",
     "text":         "#c9d1d9",
     "text_dim":     "#8b949e",
     "text_bright":  "#f0f6fc",
@@ -109,17 +192,15 @@ FONTS = {
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# SRT PARSER & WRITER  —  robust encoding detection
+# SRT PARSER & WRITER
 # ═══════════════════════════════════════════════════════════════════════
 
-_ENCODINGS = ["utf-8-sig", "utf-8", "latin-1", "cp1252", "iso-8859-1", "cp1250"]
+_ENCODINGS = ["utf-8-sig", "utf-8", "cp1252", "latin-1", "cp1250"]
+_TS_RE = re.compile(r"(\d+):(\d\d):(\d\d)[,.](\d{1,3})\s*-->\s*(\d+):(\d\d):(\d\d)[,.](\d{1,3})")
 
 
-def _read_text(filepath: str) -> tuple[str, str]:
-    """
-    Try encodings in order. Returns (text, encoding_name_used).
-    Last resort: latin-1 with replacement chars.
-    """
+def _read_text(filepath: str) -> tuple:
+    """Try encodings in order. Returns (text, encoding_name_used)."""
     for enc in _ENCODINGS:
         try:
             with open(filepath, "r", encoding=enc) as f:
@@ -131,53 +212,66 @@ def _read_text(filepath: str) -> tuple[str, str]:
     return raw.decode("latin-1", errors="replace"), "latin-1 (lossy)"
 
 
-def parse_srt(filepath: str) -> tuple[list, str]:
+def parse_srt_text(content: str) -> list:
+    """Parse SRT text into blocks. Blocks with no text are kept (empty list)."""
+    blocks = []
+    content = content.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
+    for rb in re.split(r"\n\s*\n+", content.strip()):
+        lines = [l.strip() for l in rb.strip().split("\n")]
+        if len(lines) >= 2 and "-->" in lines[1]:
+            blocks.append({"id": lines[0], "timestamp": lines[1],
+                           "text_lines": [l for l in lines[2:]]})
+        elif len(lines) >= 1 and "-->" in lines[0]:
+            # Missing index line: synthesise one so structure stays valid
+            blocks.append({"id": str(len(blocks) + 1), "timestamp": lines[0],
+                           "text_lines": lines[1:]})
+    return blocks
+
+
+def parse_srt(filepath: str) -> tuple:
     """Returns (blocks, encoding_used)."""
     content, enc = _read_text(filepath)
-    blocks = []
-    raw = re.split(r'\r?\n\r?\n+', content.strip())
-    for rb in raw:
-        lines = rb.strip().split('\n')
-        lines = [l.strip() for l in lines]
-        if len(lines) >= 3 and '-->' in lines[1]:
-            blocks.append({
-                'id':         lines[0],
-                'timestamp':  lines[1],
-                'text_lines': lines[2:],
-            })
-    return blocks, enc
+    return parse_srt_text(content), enc
 
 
 def write_srt(blocks: list, filepath: str):
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write('\ufeff')
+    with open(filepath, "w", encoding="utf-8", newline="") as f:
+        f.write("﻿")
         for block in blocks:
-            f.write(f"{block['id']}\r\n")
-            f.write(f"{block['timestamp']}\r\n")
-            for line in block['text_lines']:
+            f.write(f"{block['id']}\r\n{block['timestamp']}\r\n")
+            for line in block["text_lines"]:
                 f.write(f"{line}\r\n")
-            f.write('\r\n')
+            f.write("\r\n")
+
+
+def timestamp_ms(timestamp: str) -> tuple:
+    """'00:01:02,345 --> 00:01:04,000' → (62345, 64000). (0, 0) if unparsable."""
+    m = _TS_RE.search(timestamp)
+    if not m:
+        return 0, 0
+    g = [int(x) for x in m.groups()]
+    start = ((g[0] * 60 + g[1]) * 60 + g[2]) * 1000 + int(str(g[3]).ljust(3, "0"))
+    end   = ((g[4] * 60 + g[5]) * 60 + g[6]) * 1000 + int(str(g[7]).ljust(3, "0"))
+    return start, end
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# LANGUAGE DETECTION
+# LANGUAGE DETECTION & BATCH SIZE
 # ═══════════════════════════════════════════════════════════════════════
 
 def detect_language(blocks: list) -> str:
-    sample = ' '.join(' '.join(b['text_lines']) for b in blocks[:30]).lower()
+    sample = " ".join(" ".join(b["text_lines"]) for b in blocks[:40]).lower()
     patterns = [
-        ("ja-JP",    r'[\u3040-\u309f\u30a0-\u30ff]'),
-        ("ko-KR",    r'[\uac00-\ud7af]'),
-        ("zh-CN",    r'[\u4e00-\u9fff]{3,}'),
-        ("ar-AR",    r'[\u0600-\u06ff]'),
-        ("en-US",    r'\b(the|and|is|are|you|have|what|this|that|with|for|not|but|they|was|will|would|could|can|how|who|where|when|why)\b'),
-        ("pt-BR",    r'\b(que|não|nao|uma|com|para|esta|isso|como|mas|mais|ele|ela|voce|tem|são|sao|muito|pode|então|entao|tambem|fazer|quando)\b'),
-        ("pt-PT",    r'\b(que|não|nao|uma|com|para|esta|isso|como|mas|mais|ele|ela|vocês|tem|são|muito|pode|então|também|fazer|quando)\b'),
-        ("es-ES",    r'\b(que|los|las|una|por|con|para|esta|esto|como|pero|mas|tiene|son|muy|puede|tambien|hacer|cuando)\b'),
-        ("es-LATAM", r'\b(que|los|las|una|por|con|para|esta|esto|como|pero|más|tiene|son|muy|puede|también|hacer|cuando)\b'),
-        ("fr-FR",    r'\b(les|des|une|que|est|pas|pour|dans|avec|qui|sur|sont|mais|plus|tout|peut|cette|aussi|faire|comme)\b'),
-        ("de-DE",    r'\b(und|der|die|das|ist|nicht|ein|eine|ich|sie|wir|auf|mit|den|von|hat|für|sind|auch|aber|oder|wenn)\b'),
-        ("it-IT",    r'\b(che|non|una|per|sono|con|come|più|questo|anche|della|quello|hanno|essere|fare|tutto)\b'),
+        ("ja-JP",    r"[぀-ゟ゠-ヿ]"),
+        ("ko-KR",    r"[가-힯]"),
+        ("zh-CN",    r"[一-鿿]{3,}"),
+        ("ar-AR",    r"[؀-ۿ]"),
+        ("en-US",    r"\b(the|and|is|are|you|have|what|this|that|with|for|not|but|they|was|will|would|could|can|how|who|where|when|why)\b"),
+        ("pt-BR",    r"\b(que|não|nao|uma|com|para|esta|isso|como|mas|mais|ele|ela|voce|você|tem|são|sao|muito|pode|então|entao|também|fazer|quando)\b"),
+        ("es-ES",    r"\b(que|los|las|una|por|con|para|esta|esto|como|pero|más|tiene|son|muy|puede|también|hacer|cuando)\b"),
+        ("fr-FR",    r"\b(les|des|une|que|est|pas|pour|dans|avec|qui|sur|sont|mais|plus|tout|peut|cette|aussi|faire|comme)\b"),
+        ("de-DE",    r"\b(und|der|die|das|ist|nicht|ein|eine|ich|sie|wir|auf|mit|den|von|hat|für|sind|auch|aber|oder|wenn)\b"),
+        ("it-IT",    r"\b(che|non|una|per|sono|con|come|più|questo|anche|della|quello|hanno|essere|fare|tutto)\b"),
     ]
     best_code, best_count = "en-US", 0
     for code, pattern in patterns:
@@ -190,276 +284,816 @@ def detect_language(blocks: list) -> str:
 def suggest_batch_size(blocks: list) -> int:
     if not blocks:
         return 25
-    avg = sum(len(' '.join(b['text_lines'])) for b in blocks) / len(blocks)
-    if avg < 50:   return 40
-    elif avg < 120: return 25
-    else:           return 15
+    avg = sum(len(" ".join(b["text_lines"])) for b in blocks) / len(blocks)
+    if avg < 50:
+        return 40
+    if avg < 120:
+        return 25
+    return 15
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# PRICING ENGINE  —  hardcoded fallback + optional live fetch
+# OUTPUT NAMING  —  strip the source language tag (Movie.en.srt → Movie)
 # ═══════════════════════════════════════════════════════════════════════
 
-# Hardcoded current rates ($ per million tokens) — verified May 2026
-# Input : Output ratio is always 1:5 across current models
-_FALLBACK_PRICES = {
-    "claude-haiku-4-5-20251001":  {"input": 1.00,  "output": 5.00,  "label": "Haiku 4.5"},
-    "claude-sonnet-4-5-20250929": {"input": 3.00,  "output": 15.00, "label": "Sonnet 4.5"},
-    "claude-sonnet-4-20250514":   {"input": 3.00,  "output": 15.00, "label": "Sonnet 4"},
+_LANG_TAG_WORDS = {
+    "en", "eng", "english", "es", "spa", "spanish", "pt", "por", "ptbr", "portuguese",
+    "fr", "fra", "fre", "french", "de", "ger", "deu", "german", "it", "ita", "italian",
+    "ja", "jpn", "japanese", "ko", "kor", "korean", "zh", "chi", "zho", "chinese",
+    "ar", "ara", "arabic", "ru", "rus", "nl", "dut", "sv", "swe", "no", "nor", "da", "dan",
+    "fi", "fin", "pl", "pol", "tr", "tur", "hi", "hin", "cs", "hu", "el", "he", "th", "vi",
+    "sdh", "cc", "forced", "hi",
+}
+_LANG_TAG_RE = re.compile(r"\.([A-Za-z]{2,10})(?:[-_]([A-Za-z]{2,4}))?$")
+
+
+def strip_language_tag(stem: str) -> str:
+    """'Movie.en' → 'Movie'; 'Movie.en-US.sdh' → 'Movie'; 'Movie.2023' unchanged."""
+    changed = True
+    while changed:
+        changed = False
+        m = _LANG_TAG_RE.search(stem)
+        if m and m.group(1).lower() in _LANG_TAG_WORDS:
+            stem = stem[:m.start()]
+            changed = True
+    return stem
+
+
+def default_output_name(input_path: str, target_code: str) -> str:
+    return f"{strip_language_tag(Path(input_path).stem)}.{target_code}.srt"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CUES, TAGS & PASSTHROUGH
+# ═══════════════════════════════════════════════════════════════════════
+
+_TAG_RE = re.compile(r"(</?[A-Za-z][^<>]*>|\{\\[^{}]*\})")
+_PUNCT_ONLY_RE = re.compile(r"^[\W\d_♪♫]*$")   # no letters at all (♪, digits, dashes)
+_CUE_BRACKET_RE = re.compile(r"^\s*[\[(].*[\])]\s*:?\s*$")
+_CUE_CAPS_RE = re.compile(r"^[^a-z]*[A-Z][^a-z]*$")
+
+
+def protect_tags(line: str) -> tuple:
+    """Replace <i>…</i> / {\\an8} tags with {T1}, {T2}… placeholders."""
+    tags = []
+
+    def rep(m):
+        tags.append(m.group(0))
+        return f"{{T{len(tags)}}}"
+    return _TAG_RE.sub(rep, line), tags
+
+
+def restore_tags(line: str, tags: list) -> str:
+    for i, tag in enumerate(tags, 1):
+        ph = f"{{T{i}}}"
+        if ph in line:
+            line = line.replace(ph, tag, 1)
+        elif tag.startswith("</"):
+            line = line + tag
+        else:
+            line = tag + line
+    # Remove any stray placeholder the model may have invented
+    return re.sub(r"\{T\d+\}", "", line)
+
+
+def is_cue(line: str) -> bool:
+    """Hearing-impaired cue: [door slams], (laughs), APPLAUSE, MAN ON TV:"""
+    s = _TAG_RE.sub("", line).strip()
+    if not s or _PUNCT_ONLY_RE.match(s):
+        return False
+    if _CUE_BRACKET_RE.match(s):
+        return True
+    letters = re.sub(r"[^A-Za-z]", "", s)
+    return len(letters) >= 3 and bool(_CUE_CAPS_RE.match(s))
+
+
+def is_passthrough(line: str, translate_cues: bool = True) -> bool:
+    """Lines that are never sent for translation."""
+    s = _TAG_RE.sub("", line).strip()
+    if not s or _PUNCT_ONLY_RE.match(s):
+        return True
+    if not translate_cues and is_cue(s):
+        return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# GLOSSARY  (names to preserve)
+# ═══════════════════════════════════════════════════════════════════════
+
+def parse_glossary(text: str) -> list:
+    """One term per line (commas also accepted). Keeps order, drops duplicates."""
+    seen, out = set(), []
+    for raw in re.split(r"[\n,;]+", text or ""):
+        term = raw.strip().strip("•-–").strip()
+        if len(term) >= 2 and term.lower() not in seen:
+            seen.add(term.lower())
+            out.append(term)
+    return out
+
+
+def glossary_sidecar_path(srt_path: str) -> Path:
+    p = Path(srt_path)
+    return p.with_name(strip_language_tag(p.stem) + ".names.txt")
+
+
+def glossary_violations(src_text: str, out_text: str, terms: list) -> list:
+    """Terms present in the source block but absent from the translated block."""
+    missing = []
+    for term in terms:
+        pat = r"(?<!\w)" + re.escape(term) + r"(?!\w)"
+        if re.search(pat, src_text) and not re.search(pat, out_text, re.IGNORECASE):
+            missing.append(term)
+    return missing
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODEL CATALOG & PRICING
+# ═══════════════════════════════════════════════════════════════════════
+
+PRICING_URL = "https://platform.claude.com/docs/en/about-claude/pricing.md"
+PRICING_OVERRIDE_PATH = APP_DIR / "pricing.json"
+PRICING_TTL_S = 24 * 3600
+MODELS_TTL_S  = 24 * 3600
+DEFAULT_MODEL = "claude-haiku-5-5"
+
+# $ per million tokens — verified 2026-10-09 against the official pricing page.
+# Keys are "family version" (see model_family_key). Last-resort fallback only.
+_BUILTIN_PRICES = {
+    "fable 5.1":  {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write": 12.5},
+    "fable 5":    {"input": 10.0, "output": 50.0, "cache_read": 1.0,  "cache_write": 12.5},
+    "opus 5.5":   {"input": 4.0,  "output": 20.0, "cache_read": 0.20, "cache_write": 5.0},
+    "opus 5":     {"input": 5.0,  "output": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "opus 4.8":   {"input": 5.0,  "output": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "opus 4.7":   {"input": 5.0,  "output": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "opus 4.6":   {"input": 5.0,  "output": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "opus 4.5":   {"input": 5.0,  "output": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "sonnet 5.5": {"input": 2.0,  "output": 10.0, "cache_read": 0.20, "cache_write": 2.5},
+    "sonnet 5":   {"input": 2.0,  "output": 10.0, "cache_read": 0.20, "cache_write": 2.5},
+    "sonnet 4.6": {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_write": 3.75},
+    "sonnet 4.5": {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_write": 3.75},
+    "haiku 5.5":  {"input": 0.10, "output": 0.50, "cache_read": 0.01, "cache_write": 0.125},
+    "haiku 4.5":  {"input": 1.0,  "output": 5.0,  "cache_read": 0.10, "cache_write": 1.25},
 }
 
-# Cache for live prices: {model_id: {input, output, fetched_at}}
-_live_price_cache: dict = {}
-_PRICE_CACHE_TTL = 3600  # seconds
+# Offline fallback list (what the API returned on 2026-10-09), newest first.
+_BUILTIN_MODELS = [
+    {"id": "claude-haiku-5-5",          "display_name": "Claude Haiku 5.5",  "created_at": "2026-10-07", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "disabled", "effort": True,  "structured": True},
+    {"id": "claude-sonnet-5-5",         "display_name": "Claude Sonnet 5.5", "created_at": "2026-09-28", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "effort",   "effort": True,  "structured": True},
+    {"id": "claude-opus-5-5",           "display_name": "Claude Opus 5.5",   "created_at": "2026-09-21", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "effort",   "effort": True,  "structured": True},
+    {"id": "claude-fable-5-1",          "display_name": "Claude Fable 5.1",  "created_at": "2026-08-28", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "effort",   "effort": True,  "structured": True},
+    {"id": "claude-opus-5",             "display_name": "Claude Opus 5",     "created_at": "2026-07-24", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "disabled", "effort": True,  "structured": True},
+    {"id": "claude-sonnet-5",           "display_name": "Claude Sonnet 5",   "created_at": "2026-06-29", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "disabled", "effort": True,  "structured": True},
+    {"id": "claude-fable-5",            "display_name": "Claude Fable 5",    "created_at": "2026-06-07", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "effort",   "effort": True,  "structured": True},
+    {"id": "claude-opus-4-8",           "display_name": "Claude Opus 4.8",   "created_at": "2026-05-28", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "disabled", "effort": True,  "structured": True},
+    {"id": "claude-opus-4-7",           "display_name": "Claude Opus 4.7",   "created_at": "2026-04-14", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "disabled", "effort": True,  "structured": True},
+    {"id": "claude-sonnet-4-6",         "display_name": "Claude Sonnet 4.6", "created_at": "2026-02-17", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "disabled", "effort": True,  "structured": True},
+    {"id": "claude-opus-4-6",           "display_name": "Claude Opus 4.6",   "created_at": "2026-02-04", "max_input_tokens": 1000000, "max_tokens": 128000, "thinking_off": "disabled", "effort": True,  "structured": True},
+    {"id": "claude-opus-4-5-20251101",  "display_name": "Claude Opus 4.5",   "created_at": "2025-11-24", "max_input_tokens": 200000,  "max_tokens": 64000,  "thinking_off": None,       "effort": False, "structured": True},
+    {"id": "claude-haiku-4-5-20251001", "display_name": "Claude Haiku 4.5",  "created_at": "2025-10-15", "max_input_tokens": 200000,  "max_tokens": 64000,  "thinking_off": None,       "effort": False, "structured": True},
+    {"id": "claude-sonnet-4-5-20250929","display_name": "Claude Sonnet 4.5", "created_at": "2025-09-29", "max_input_tokens": 200000,  "max_tokens": 64000,  "thinking_off": None,       "effort": False, "structured": True},
+]
+
+_FAMILY_NAME_RE = re.compile(r"^\s*Claude\s+(Haiku|Sonnet|Opus|Fable|Mythos)\s+(\d+(?:\.\d+)?)", re.I)
+_FAMILY_ID_RE   = re.compile(r"^claude-(haiku|sonnet|opus|fable|mythos)-(\d)(?:-(\d))?(?:-\d{8})?$")
 
 
-def fetch_live_prices(api_key: str) -> dict:
-    """
-    Attempt to retrieve current model pricing from the Anthropic API.
-    Returns a dict keyed by model_id with {input, output} in $/MTok,
-    or an empty dict if the fetch fails or is not supported.
+def model_family_key(model_id_or_name: str) -> str:
+    """'claude-haiku-4-5-20251001' or 'Claude Haiku 4.5 (…)' → 'haiku 4.5'; '' if unknown."""
+    s = model_id_or_name.strip()
+    m = _FAMILY_ID_RE.match(s)
+    if m:
+        ver = m.group(2) + (f".{m.group(3)}" if m.group(3) else "")
+        return f"{m.group(1)} {ver}"
+    m = _FAMILY_NAME_RE.match(s)
+    if m:
+        return f"{m.group(1).lower()} {m.group(2)}"
+    return ""
 
-    The /v1/models endpoint (as of 2025) does not expose pricing, so we
-    call it purely to confirm the model IDs are valid and fall through to
-    the hardcoded table.  A future Anthropic pricing endpoint would plug
-    in here.
-    """
-    if not api_key.strip():
-        return {}
-    now = time.time()
-    # Return cached result if still fresh
-    if _live_price_cache and now - _live_price_cache.get("_fetched", 0) < _PRICE_CACHE_TTL:
-        return {k: v for k, v in _live_price_cache.items() if k != "_fetched"}
+
+def _money(cell: str):
+    m = re.search(r"\$\s*([\d.]+)", cell)
+    return float(m.group(1)) if m else None
+
+
+def parse_pricing_markdown(text: str) -> dict:
+    """Parse the official pricing page (markdown) into {family_key: prices}."""
+    prices, in_table = {}, False
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            in_table = False
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if "Base input tokens" in line and "Output tokens" in line:
+            in_table = True
+            continue
+        if not in_table or len(cells) < 6 or set(cells[1]) <= set(":- "):
+            continue
+        key = model_family_key(cells[0])
+        if not key or key in prices:          # first row wins (Haiku 5.5 ≤100k tier)
+            continue
+        vals = [_money(c) for c in cells[1:6]]
+        if None in vals:
+            continue
+        prices[key] = {"input": vals[0], "cache_write": vals[1],
+                       "cache_read": vals[3], "output": vals[4]}
+    return prices
+
+
+def fetch_official_prices(timeout: int = 15) -> dict:
+    """Download and parse the official pricing page. {} on any failure."""
     try:
-        resp = requests.get(
-            "https://api.anthropic.com/v1/models",
-            headers={
-                "x-api-key": api_key.strip(),
-                "anthropic-version": "2023-06-01",
-            },
-            timeout=8,
-        )
-        if resp.ok:
-            # API confirmed reachable — use hardcoded prices (most reliable source)
-            _live_price_cache.update(_FALLBACK_PRICES)
-            _live_price_cache["_fetched"] = now
+        r = _requests().get(PRICING_URL, timeout=timeout,
+                            headers={"User-Agent": f"srt-translator/{APP_VERSION}"})
+        if r.ok:
+            return parse_pricing_markdown(r.text)
     except Exception:
         pass
-    return {k: v for k, v in _live_price_cache.items() if k != "_fetched"}
+    return {}
 
 
-def get_price(model_id: str, api_key: str = "") -> dict:
-    """Return {input, output, label} for a model, $/MTok."""
-    live = fetch_live_prices(api_key)
-    return live.get(model_id) or _FALLBACK_PRICES.get(model_id, {"input": 3.0, "output": 15.0, "label": model_id})
+def load_pricing_override() -> dict:
+    """Optional pricing.json next to the app: {"haiku 5.5": {"input": 0.1, "output": 0.5}, …}"""
+    try:
+        if PRICING_OVERRIDE_PATH.exists():
+            data = json.load(open(PRICING_OVERRIDE_PATH, encoding="utf-8"))
+            return {k.lower().strip(): v for k, v in data.items() if isinstance(v, dict)}
+    except Exception:
+        pass
+    return {}
 
 
-def estimate_cost(blocks: list, model_id: str, api_key: str = "", has_context: bool = False) -> dict:
+def _cap(caps: dict, *path) -> bool:
+    node = caps or {}
+    for p in path:
+        if not isinstance(node, dict):
+            return False
+        node = node.get(p)
+    return bool(node)
+
+
+def model_info_from_api(m) -> dict:
+    """Normalise an SDK ModelInfo into the dict shape used by the app."""
+    caps = getattr(m, "capabilities", None) or {}
+    if hasattr(caps, "model_dump"):
+        caps = caps.model_dump()
+    thinking_off = None
+    if _cap(caps, "thinking", "types", "disabled", "supported"):
+        thinking_off = "disabled"
+    elif _cap(caps, "effort", "low", "supported"):
+        thinking_off = "effort"
+    created = getattr(m, "created_at", None)
+    return {
+        "id":               m.id,
+        "display_name":     getattr(m, "display_name", m.id),
+        "created_at":       created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else str(created or "")[:10],
+        "max_input_tokens": getattr(m, "max_input_tokens", None),
+        "max_tokens":       getattr(m, "max_tokens", None),
+        "thinking_off":     thinking_off,
+        "effort":           _cap(caps, "effort", "supported"),
+        "structured":       _cap(caps, "structured_outputs", "supported") if "structured_outputs" in caps else True,
+    }
+
+
+def fetch_models(api_key: str) -> list:
+    """Live model list from the API, newest first. Raises on failure."""
+    client = _anthropic().Anthropic(api_key=api_key.strip(), max_retries=2, timeout=20)
+    models = [model_info_from_api(m) for m in client.models.list(limit=100)]
+    models = [m for m in models if model_family_key(m["id"])]      # Claude chat models only
+    models.sort(key=lambda m: m["created_at"], reverse=True)
+    return models
+
+
+class Catalog:
+    """Models + prices with offline cache in the config file."""
+
+    def __init__(self, cfg: dict):
+        mc = cfg.get("models_cache") or {}
+        pc = cfg.get("pricing_cache") or {}
+        self.models: list = mc.get("models") or list(_BUILTIN_MODELS)
+        self.models_fetched_at: float = float(mc.get("fetched_at") or 0)
+        self.models_source = "cache" if mc.get("models") else "built-in"
+        self.prices: dict = pc.get("prices") or {}
+        self.prices_fetched_at: float = float(pc.get("fetched_at") or 0)
+        self.prices_source = "cache" if pc.get("prices") else "built-in"
+        self.override = load_pricing_override()
+
+    # ── refresh ──────────────────────────────────────────────────────
+    def models_stale(self) -> bool:
+        return time.time() - self.models_fetched_at > MODELS_TTL_S
+
+    def prices_stale(self) -> bool:
+        return time.time() - self.prices_fetched_at > PRICING_TTL_S
+
+    def refresh_models(self, api_key: str) -> bool:
+        if not api_key.strip():
+            return False
+        self.models = fetch_models(api_key)
+        self.models_fetched_at = time.time()
+        self.models_source = "live"
+        save_config({"models_cache": {"models": self.models, "fetched_at": self.models_fetched_at}})
+        return True
+
+    def refresh_prices(self) -> bool:
+        prices = fetch_official_prices()
+        if not prices:
+            return False
+        self.prices = prices
+        self.prices_fetched_at = time.time()
+        self.prices_source = "live"
+        save_config({"pricing_cache": {"prices": prices, "fetched_at": self.prices_fetched_at}})
+        return True
+
+    # ── lookups ──────────────────────────────────────────────────────
+    def model(self, model_id: str) -> dict:
+        for m in self.models:
+            if m["id"] == model_id:
+                return m
+        for m in _BUILTIN_MODELS:
+            if m["id"] == model_id:
+                return m
+        return {"id": model_id, "display_name": model_id, "created_at": "", "max_input_tokens": None,
+                "max_tokens": None, "thinking_off": None, "effort": False, "structured": True}
+
+    def has_model(self, model_id: str) -> bool:
+        return any(m["id"] == model_id for m in self.models)
+
+    def pick_default(self, preferred: str) -> str:
+        if preferred and self.has_model(preferred):
+            return preferred
+        if self.has_model(DEFAULT_MODEL):
+            return DEFAULT_MODEL
+        return self.models[0]["id"] if self.models else DEFAULT_MODEL
+
+    def price(self, model_id: str) -> dict:
+        """{input, output, cache_read, cache_write, source}; None values if unknown."""
+        key = model_family_key(model_id)
+        for src, table in (("override", self.override), (self.prices_source, self.prices),
+                           ("built-in", _BUILTIN_PRICES)):
+            p = table.get(key)
+            if p and p.get("input") is not None and p.get("output") is not None:
+                out = {"input": float(p["input"]), "output": float(p["output"]),
+                       "cache_read": float(p.get("cache_read", p["input"] * 0.1)),
+                       "cache_write": float(p.get("cache_write", p["input"] * 1.25)),
+                       "source": src}
+                return out
+        return {"input": None, "output": None, "cache_read": None, "cache_write": None, "source": "unknown"}
+
+    def label(self, model_id: str) -> str:
+        m, p = self.model(model_id), self.price(model_id)
+        ctx = m.get("max_input_tokens")
+        ctx_s = f"{ctx // 1000}K" if ctx and ctx < 1_000_000 else ("1M" if ctx else "?")
+        price_s = (f"${p['input']:g} / ${p['output']:g}" if p["input"] is not None else "price unknown")
+        tag = "   ★ recommended" if model_id == DEFAULT_MODEL else ("   (older)" if re.search(r"-\d{8}$", model_id) else "")
+        return f"{m['display_name']}   ·   {price_s} per MTok   ·   {ctx_s} ctx{tag}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# COST ESTIMATE & USAGE
+# ═══════════════════════════════════════════════════════════════════════
+
+_OUTPUT_RATIO = {"ja": 0.9, "zh": 0.8, "ko": 0.9, "ar": 1.0, "de": 1.1, "pt": 1.15,
+                 "es": 1.15, "fr": 1.15, "it": 1.1, "en": 1.0}
+
+
+class UsageTotals:
+    """Thread-safe accumulator for API usage across batches."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.input = self.output = self.cache_read = self.cache_write = 0
+        self.calls = 0
+
+    def add(self, usage):
+        if usage is None:
+            return
+        with self.lock:
+            self.input       += int(getattr(usage, "input_tokens", 0) or 0)
+            self.output      += int(getattr(usage, "output_tokens", 0) or 0)
+            self.cache_read  += int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+            self.cache_write += int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+            self.calls += 1
+
+    def cost(self, price: dict):
+        if price.get("input") is None:
+            return None
+        return (self.input * price["input"] + self.output * price["output"]
+                + self.cache_read * price["cache_read"] + self.cache_write * price["cache_write"]) / 1e6
+
+    def summary(self, price: dict) -> str:
+        c = self.cost(price)
+        cost_s = f"${c:.4f}" if c is not None else "unknown price"
+        return (f"{cost_s}  ({self.input:,} in · {self.output:,} out · "
+                f"{self.cache_read:,} cached · {self.calls} calls)")
+
+
+def estimate_cost(blocks: list, model_id: str, catalog: Catalog, *, api_key: str = "",
+                  ctx_blocks: list = None, glossary: list = None, batch_size: int = 25,
+                  translate_cues: bool = True, target_code: str = "pt-BR",
+                  src_label: str = "English", tgt_label: str = "Portuguese",
+                  exact: bool = False) -> dict:
     """
-    Rough cost estimate for translating a list of blocks.
-    Returns {input_tokens, output_tokens, input_cost, output_cost, total_cost, price_per_mtok}.
-    
-    Token estimation:
-      ~4 chars ≈ 1 token (conservative; subtitles are short lines)
-      Input  = source text + system prompt overhead per batch
-      Output = estimated ~1.1× source (translations are slightly longer)
-      Context file adds ~20% extra input tokens if provided.
+    Cost estimate. exact=True calls the free count_tokens endpoint for the
+    input side (needs api_key); otherwise ~3.5 chars per token.
     """
     if not blocks:
         return {}
+    glossary = glossary or []
+    ctx_blocks = ctx_blocks or []
+    n_batches = max(1, -(-len(blocks) // max(1, batch_size)))
+    system = build_system_prompt(src_label, tgt_label, glossary)
+    all_prompt, items = build_batch_prompt(blocks, translate_cues)
+    n_lines = sum(len(needs) for _, needs, _, _ in items)
+    ctx_script = "\n".join(l for b in ctx_blocks for l in b["text_lines"] if l.strip())
 
-    total_chars = sum(len(' '.join(b['text_lines'])) for b in blocks)
-    src_tokens  = total_chars / 3.5   # subtitles tend to be dense
-
-    # System prompt overhead: ~80 tokens per batch call
-    bsize         = suggest_batch_size(blocks)
-    n_batches     = max(1, len(blocks) // bsize)
-    sys_overhead  = n_batches * 80
-
-    input_tokens  = src_tokens + sys_overhead
-    if has_context:
-        input_tokens *= 1.20  # context file overhead
-
-    output_tokens = src_tokens * 1.15  # translations slightly longer than source
-
-    pricing = get_price(model_id, api_key)
-    in_cost  = (input_tokens  / 1_000_000) * pricing["input"]
-    out_cost = (output_tokens / 1_000_000) * pricing["output"]
-    total    = in_cost + out_cost
-
-    return {
-        "input_tokens":    int(input_tokens),
-        "output_tokens":   int(output_tokens),
-        "input_cost":      in_cost,
-        "output_cost":     out_cost,
-        "total_cost":      total,
-        "input_mtok":      pricing["input"],
-        "output_mtok":     pricing["output"],
-        "model_label":     pricing.get("label", model_id),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# CONTEXT FILE HELPER
-# ═══════════════════════════════════════════════════════════════════════
-
-def build_context_script(blocks: list) -> str:
-    """
-    Convert context SRT blocks into a plain-text script (NO IDs or
-    timestamps) suitable for inclusion in a Claude system prompt.
-    Structure data is deliberately stripped so it cannot contaminate
-    the source file's timestamps or IDs.
-    """
-    lines = []
-    for b in blocks:
-        for ln in b['text_lines']:
-            stripped = ln.strip()
-            if stripped:
-                lines.append(stripped)
-    return '\n'.join(lines)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# TRANSLATION ENGINES
-# ═══════════════════════════════════════════════════════════════════════
-
-_SYSTEM_PROMPT_TEMPLATE = (
-    "You are a professional subtitle translator. "
-    "Translate from {src} to {tgt}. "
-    "Rules: preserve tone/humor/slang/names; natural idiomatic {tgt}; "
-    "translate [sound effects] inside brackets; keep pure punctuation as-is. "
-    "Input: numbered blocks like [1] text. "
-    "Output: ONLY the same numbered blocks with translated text. "
-    "Exact same block count and numbers. No extra text."
-)
-
-_SYSTEM_PROMPT_WITH_CONTEXT = (
-    "You are a professional subtitle translator. "
-    "Translate from {src} to {tgt}. "
-    "Rules: preserve tone/humor/slang/names; natural idiomatic {tgt}; "
-    "translate [sound effects] inside brackets; keep pure punctuation as-is. "
-    "Input: numbered blocks like [1] text. "
-    "Output: ONLY the same numbered blocks with translated text. "
-    "Exact same block count and numbers. No extra text.\n\n"
-    "REFERENCE SCRIPT (same film/episode in another language — use ONLY for "
-    "understanding dialogue meaning, character names, and context; do NOT copy "
-    "its text into your output):\n"
-    "---\n{context}\n---"
-)
-
-_PASSTHROUGH_RE = re.compile(
-    r'^([\-\u2013\u2014\.\,\!\?\:\s]*|\[.*?\]|\(.*?\))$'
-)
-
-def _is_passthrough(line: str) -> bool:
-    s = line.strip()
-    return not s or bool(_PASSTHROUGH_RE.match(s))
-
-
-def _call_claude_api(prompt_text: str, system: str, api_key: str,
-                     model: str, max_tokens: int = 2048) -> str:
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": api_key.strip(),
-        "anthropic-version": "2023-06-01",
-    }
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": [{"role": "user", "content": prompt_text}],
-    }
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers=headers, json=payload, timeout=90,
-    )
-    if not resp.ok:
+    method = "approx"
+    if exact and api_key.strip():
         try:
-            err_body = resp.json()
-            err_msg = err_body.get("error", {}).get("message", resp.text)
+            client = _anthropic().Anthropic(api_key=api_key.strip(), max_retries=1, timeout=30)
+
+            def count(text):
+                return client.messages.count_tokens(
+                    model=model_id, messages=[{"role": "user", "content": text or "x"}]).input_tokens
+            sys_tokens  = count(system)
+            text_tokens = count(all_prompt)
+            ctx_tokens  = count(ctx_script) if ctx_script else 0
+            method = "exact"
         except Exception:
-            err_msg = resp.text
-        raise RuntimeError(f"HTTP {resp.status_code}: {err_msg}")
-    return resp.json()["content"][0]["text"].strip()
+            exact = False
+    if method == "approx":
+        sys_tokens  = len(system) / 3.5
+        text_tokens = len(all_prompt) / 3.5
+        ctx_tokens  = len(ctx_script) / 3.5
+
+    ratio = _OUTPUT_RATIO.get(target_code.split("-")[0].lower(), 1.1)
+    input_tokens  = text_tokens + n_batches * (sys_tokens + 40) + ctx_tokens * 1.3
+    output_tokens = text_tokens * ratio + n_lines * 7 + n_batches * 12
+
+    price = catalog.price(model_id)
+    if price["input"] is None:
+        return {"input_tokens": int(input_tokens), "output_tokens": int(output_tokens),
+                "total_cost": None, "method": method, "price": price}
+    in_cost  = input_tokens / 1e6 * price["input"]
+    out_cost = output_tokens / 1e6 * price["output"]
+    return {"input_tokens": int(input_tokens), "output_tokens": int(output_tokens),
+            "input_cost": in_cost, "output_cost": out_cost, "total_cost": in_cost + out_cost,
+            "method": method, "price": price, "n_batches": n_batches}
 
 
-def translate_batch_claude(blocks: list, source_lang: str, target_lang: str,
-                           api_key: str, model: str,
-                           context_script: str = "") -> list:
-    if context_script:
-        system = _SYSTEM_PROMPT_WITH_CONTEXT.format(
-            src=source_lang, tgt=target_lang, context=context_script)
-    else:
-        system = _SYSTEM_PROMPT_TEMPLATE.format(src=source_lang, tgt=target_lang)
+# ═══════════════════════════════════════════════════════════════════════
+# PROMPTS & TRANSLATION  (Claude)
+# ═══════════════════════════════════════════════════════════════════════
 
-    to_translate = []
-    results = [None] * len(blocks)
+_SYSTEM_PROMPT = """You are a professional subtitle translator. Translate from {src} to {tgt}.
 
+Rules:
+1. Translate EVERY line, including hearing-impaired cues such as [door slams], (laughs) or APPLAUSE. Keep the same bracket, parenthesis or ALL-CAPS style the cue had.
+2. Each block is shown on screen at its own time, so translate each block using only the words of that block: never move words into the previous or next block. Each block has a fixed number of lines; return exactly that many lines, in order. You may rebalance wording between the lines of one block so each line reads naturally, but never merge lines, drop a line or add one.
+3. Keep placeholders like {{T1}} exactly where they belong; they stand for formatting tags. {{Q}} stands for a double-quote character: keep {{Q}} where the quote belongs in the translation.
+4. Do NOT translate or transliterate proper names of people, schools, universities, companies, institutions, brands and titles of works: keep them exactly as written. Countries, cities and nationalities use their normal {tgt} form.{glossary}
+5. Natural, idiomatic {tgt}; preserve tone, register, humour, slang and profanity level. Keep numbers, dates and currency as written.
+6. If a block is already in {tgt} or is a name/number only, return it unchanged.
+
+Input: labelled blocks like
+[k07]
+line one
+line two
+
+Output: JSON only, of the form {{"blocks":[{{"k":"k07","lines":["…","…"]}}]}} with one entry per input block. Copy each label exactly as given (labels are not sequential and must never be invented or renumbered) and keep the line count of that block.
+"""
+
+_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "blocks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "k": {"type": "string"},
+                    "lines": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["k", "lines"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["blocks"],
+    "additionalProperties": False,
+}
+
+_NAMES_SCHEMA = {
+    "type": "object",
+    "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+    "required": ["names"],
+    "additionalProperties": False,
+}
+
+CONTEXT_MARGIN_MS = 8000
+CONTEXT_MAX_LINES = 150
+
+
+def build_system_prompt(src_label: str, tgt_label: str, glossary: list) -> str:
+    g = ""
+    if glossary:
+        g = "\n   Preserve exactly these terms: " + "; ".join(glossary)
+    return _SYSTEM_PROMPT.format(src=src_label, tgt=tgt_label, glossary=g)
+
+
+_KEY_ALPHA = "abcdefghjkmnpqrstuvwxyz"   # no i / l / o
+
+
+def block_key(n: int) -> str:
+    """Non-sequential label for the n-th block of a batch (unique for n < 69).
+    Labels that cannot be produced by counting force the model to copy them,
+    so a merged or dropped block becomes a missing key instead of a silent
+    shift of every following block."""
+    # 36n + 41 is never a multiple of 100, so the digits never equal n itself
+    return f"{_KEY_ALPHA[n % len(_KEY_ALPHA)]}{(n * 37 + 41) % 100:02d}"
+
+
+def build_batch_prompt(blocks: list, translate_cues: bool) -> tuple:
+    """
+    Returns (prompt_text, items). items = [(block_index, needs, tags_per_line, key)]
+    where needs lists the line indexes sent for translation.
+    """
+    parts, items = [], []
     for i, block in enumerate(blocks):
-        needs = [j for j, ln in enumerate(block["text_lines"]) if not _is_passthrough(ln)]
+        needs = [j for j, ln in enumerate(block["text_lines"]) if not is_passthrough(ln, translate_cues)]
         if not needs:
-            results[i] = {**block, "text_lines": block["text_lines"][:]}
-        else:
-            to_translate.append((i, block, needs))
+            continue
+        protected, tags = [], {}
+        for j in needs:
+            core, t = protect_tags(block["text_lines"][j])
+            protected.append(core.replace('"', "{Q}"))   # quotes as a placeholder: no JSON escaping needed
+            tags[j] = t
+        key = block_key(len(items) + 1)
+        items.append((i, needs, tags, key))
+        parts.append(f"[{key}]\n" + "\n".join(protected))
+    return "\n\n".join(parts), items
 
-    if not to_translate:
+
+def context_window_text(ctx_blocks: list, start_ms: int, end_ms: int,
+                        frac_start: float = 0.0, frac_end: float = 1.0) -> str:
+    """Context lines whose timing overlaps [start-margin, end+margin]; falls back to
+    the proportional position in the file when timings do not overlap at all."""
+    if not ctx_blocks:
+        return ""
+    lo, hi = start_ms - CONTEXT_MARGIN_MS, end_ms + CONTEXT_MARGIN_MS
+    lines = []
+    for b in ctx_blocks:
+        s, e = b.get("_ms") or timestamp_ms(b["timestamp"])
+        if e >= lo and s <= hi:
+            lines.extend(l.strip() for l in b["text_lines"] if l.strip())
+    if not lines:
+        n = len(ctx_blocks)
+        a = max(0, int(frac_start * n) - 5)
+        z = min(n, int(frac_end * n) + 5)
+        lines = [l.strip() for b in ctx_blocks[a:z] for l in b["text_lines"] if l.strip()]
+    return "\n".join(lines[:CONTEXT_MAX_LINES])
+
+
+def rewrap(lines: list, n: int) -> list:
+    """Force a list of lines into exactly n lines, balancing by length."""
+    text = " ".join(l.strip() for l in lines if l is not None).strip()
+    text = re.sub(r"\s+", " ", text)
+    if n <= 1:
+        return [text]
+    words = text.split(" ")
+    if len(words) <= n:
+        return words + [""] * (n - len(words))
+    out, target = [], len(text) / n
+    cur = ""
+    for w in words:
+        remaining = n - len(out) - 1
+        if remaining > 0 and cur and len(cur) + 1 + len(w) > target and len(words) - words.index(w) >= remaining:
+            out.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    out.append(cur)
+    while len(out) < n:
+        out.append("")
+    while len(out) > n:
+        last = out.pop()
+        out[-1] = (out[-1] + " " + last).strip()
+    return out
+
+
+def _parse_json_blocks(raw: str) -> dict:
+    """{key: [lines]} from the model text; tolerant of stray text around the JSON."""
+    txt = raw.strip()
+    try:
+        data = json.loads(txt)
+    except Exception:
+        m = re.search(r"\{.*\}", txt, re.DOTALL)
+        data = json.loads(m.group(0)) if m else {"blocks": []}
+    out = {}
+    for b in data.get("blocks", []):
+        try:
+            key = str(b.get("k", b.get("n", ""))).strip().strip("[]")
+            out[key] = [str(x) for x in b.get("lines", [])]
+        except Exception:
+            continue
+    return out
+
+
+class BatchRefused(RuntimeError):
+    pass
+
+
+def _request_options(model_info: dict) -> dict:
+    """Thinking/effort settings that keep translation cheap on every model."""
+    opts = {}
+    if model_info.get("thinking_off") == "disabled":
+        opts["thinking"] = {"type": "disabled"}
+    elif model_info.get("thinking_off") == "effort":
+        opts.setdefault("output_config", {})["effort"] = "low"
+    if model_info.get("structured", True):
+        opts.setdefault("output_config", {})["format"] = {"type": "json_schema", "schema": _OUTPUT_SCHEMA}
+    return opts
+
+
+def claude_translate_batch(client, blocks: list, src_label: str, tgt_label: str,
+                           model_info: dict, glossary: list, ctx_text: str,
+                           translate_cues: bool, usage: UsageTotals, depth: int = 0) -> list:
+    """
+    Translate one batch. Returns new block dicts (same order). Lines that
+    could not be translated keep the source text and are flagged with
+    block["_untranslated"] = True so the QC pass can retry them.
+    """
+    results = [{**b, "text_lines": b["text_lines"][:]} for b in blocks]
+    prompt, items = build_batch_prompt(blocks, translate_cues)
+    if not items:
         return results
 
-    parts = []
-    for local_idx, (_, block, needs) in enumerate(to_translate, 1):
-        text = "\n".join(block["text_lines"][j] for j in needs)
-        parts.append(f"[{local_idx}]\n{text}")
-    prompt = "\n\n".join(parts)
+    system = build_system_prompt(src_label, tgt_label, glossary)
+    user = ""
+    if ctx_text:
+        user += ("REFERENCE (same scene in another language; use only to understand "
+                 "meaning, names and context; never copy it):\n---\n" + ctx_text + "\n---\n\n")
+    user += "SUBTITLES:\n\n" + prompt
 
-    raw = _call_claude_api(prompt, system, api_key, model,
-                           max_tokens=max(2048, len(prompt) * 2))
+    max_out = min(int(model_info.get("max_tokens") or 16000), 16000)
+    resp = client.messages.create(
+        model=model_info["id"],
+        max_tokens=max_out,
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user}],
+        **_request_options(model_info),
+    )
+    usage.add(resp.usage)
 
-    parsed = {}
-    for m in re.finditer(r'\[(\d+)\]\s*(.*?)(?=\[\d+\]|$)', raw, re.DOTALL):
-        parsed[int(m.group(1))] = m.group(2).strip().split("\n")
+    if resp.stop_reason == "refusal":
+        raise BatchRefused("the model declined this batch (safety filter)")
+    if resp.stop_reason == "max_tokens":
+        if len(blocks) > 1 and depth < 6:
+            mid = len(blocks) // 2
+            left  = claude_translate_batch(client, blocks[:mid], src_label, tgt_label, model_info,
+                                           glossary, ctx_text, translate_cues, usage, depth + 1)
+            right = claude_translate_batch(client, blocks[mid:], src_label, tgt_label, model_info,
+                                           glossary, ctx_text, translate_cues, usage, depth + 1)
+            return left + right
+        raise RuntimeError("output cut off (max_tokens) even for a single block")
 
-    for local_idx, (global_idx, block, needs) in enumerate(to_translate, 1):
-        translated_lines = parsed.get(local_idx, [])
-        new_lines = block["text_lines"][:]
-        for k, line_idx in enumerate(needs):
-            if k < len(translated_lines):
-                new_lines[line_idx] = translated_lines[k]
-        results[global_idx] = {**block, "text_lines": new_lines}
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    parsed = _parse_json_blocks(text)
 
+    missing = 0
+    for idx, needs, tags, key in items:
+        got = parsed.get(key)
+        if not got or not any(g.strip() for g in got):
+            missing += 1
+            results[idx]["_untranslated"] = True
+            continue
+        if len(got) != len(needs):
+            got = rewrap(got, len(needs))
+        for k, j in enumerate(needs):
+            results[idx]["text_lines"][j] = restore_tags(got[k].replace("{Q}", '"').strip(), tags[j])
+    if missing and missing > len(items) // 2:
+        raise RuntimeError(f"model returned {len(items) - missing}/{len(items)} blocks")
     return results
 
 
-def translate_free(text_lines, source_lang, target_lang):
-    lang_map = {
-        'pt-BR': 'pt', 'pt-PT': 'pt', 'es-ES': 'es', 'es-LATAM': 'es',
-        'en-US': 'en', 'en-GB': 'en', 'de-DE': 'de', 'fr-FR': 'fr',
-        'it-IT': 'it', 'ja-JP': 'ja', 'ko-KR': 'ko', 'zh-CN': 'zh-CN',
-        'ar-AR': 'ar',
-    }
-    src = lang_map.get(source_lang, source_lang.split('-')[0].lower()[:2])
-    tgt = lang_map.get(target_lang, target_lang.split('-')[0].lower()[:2])
+def extract_names(client, blocks: list, model_info: dict, src_label: str) -> tuple:
+    """Ask the model for proper names found in the subtitles. Returns (names, usage)."""
+    usage = UsageTotals()
+    script = "\n".join(l.strip() for b in blocks for l in b["text_lines"] if l.strip())
+    opts = {}
+    if model_info.get("thinking_off") == "disabled":
+        opts["thinking"] = {"type": "disabled"}
+    elif model_info.get("thinking_off") == "effort":
+        opts.setdefault("output_config", {})["effort"] = "low"
+    if model_info.get("structured", True):
+        opts.setdefault("output_config", {})["format"] = {"type": "json_schema", "schema": _NAMES_SCHEMA}
+    resp = client.messages.create(
+        model=model_info["id"], max_tokens=8000,
+        system=(f"You extract proper names from {src_label} subtitles. Return a JSON object "
+                '{"names": [...]} listing every distinct proper name that must stay untranslated '
+                "in a subtitle translation: people (full names and surnames as they appear), "
+                "companies, schools, universities, institutions, foundations, brands, product names, "
+                "streets, venues and titles of works. Exclude countries, continents, nationalities, "
+                "well-known cities and regions (they have a translated form), common nouns, job titles "
+                "and generic words. "
+                "Keep the original spelling and casing. Return JSON only."),
+        messages=[{"role": "user", "content": script[:400_000]}],
+        **opts,
+    )
+    usage.add(resp.usage)
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        data = json.loads(m.group(0)) if m else {"names": []}
+    names = parse_glossary("\n".join(str(x) for x in data.get("names", [])))
+    return names, usage
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TRANSLATION  (MyMemory, free)
+# ═══════════════════════════════════════════════════════════════════════
+
+_MM_LANG = {"pt-BR": "pt", "pt-PT": "pt", "es-ES": "es", "es-LATAM": "es", "en-US": "en",
+            "en-GB": "en", "de-DE": "de", "fr-FR": "fr", "it-IT": "it", "ja-JP": "ja",
+            "ko-KR": "ko", "zh-CN": "zh-CN", "ar-AR": "ar"}
+
+
+def translate_free(text_lines: list, source_lang: str, target_lang: str,
+                   translate_cues: bool = True) -> list:
+    requests = _requests()
+    src = _MM_LANG.get(source_lang, source_lang.split("-")[0].lower()[:2])
+    tgt = _MM_LANG.get(target_lang, target_lang.split("-")[0].lower()[:2])
     results = []
     for line in text_lines:
-        if not line.strip() or re.match(r'^[^\w\s]*$', line):
+        if is_passthrough(line, translate_cues):
             results.append(line)
             continue
+        core, tags = protect_tags(line)
         try:
             url = (f"https://api.mymemory.translated.net/get"
-                   f"?q={requests.utils.quote(line)}&langpair={src}|{tgt}")
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            results.append(data['responseData']['translatedText']
-                           if data.get('responseStatus') == 200 else line)
+                   f"?q={requests.utils.quote(core)}&langpair={src}|{tgt}")
+            data = requests.get(url, timeout=10).json()
+            out = data["responseData"]["translatedText"] if data.get("responseStatus") == 200 else core
         except Exception:
-            results.append(line)
+            out = core
+        results.append(restore_tags(out, tags))
     return results
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# LANGUAGE LISTS
+# QUALITY CONTROL
 # ═══════════════════════════════════════════════════════════════════════
 
-SOURCE_LANGUAGES = [
+def _norm(text: str) -> str:
+    return re.sub(r"[^\w]+", " ", _TAG_RE.sub("", text).lower()).strip()
+
+
+def _word_count(text: str) -> int:
+    return len([w for w in re.findall(r"[^\W\d_]{2,}", _TAG_RE.sub("", text))])
+
+
+def qc_block(src: dict, out: dict, glossary: list, translate_cues: bool) -> list:
+    """Issues for one block: list of (kind, detail)."""
+    issues = []
+    s_lines, o_lines = src["text_lines"], out["text_lines"]
+    if len(s_lines) != len(o_lines):
+        issues.append(("line_count", f"{len(s_lines)} → {len(o_lines)} lines"))
+    translatable = [l for l in s_lines if not is_passthrough(l, translate_cues)]
+    if translatable:
+        s_text, o_text = " ".join(s_lines), " ".join(o_lines)
+        if out.get("_untranslated"):
+            issues.append(("untranslated", "no translation returned"))
+        elif _norm(s_text) == _norm(o_text) and _word_count(s_text) >= 3:
+            issues.append(("unchanged", "text identical to source"))
+        for j, (a, b) in enumerate(zip(s_lines, o_lines)):
+            if a.strip() and not is_passthrough(a, translate_cues) and not b.strip():
+                issues.append(("empty_line", f"line {j + 1} empty"))
+        if re.search(r"\{T\d+\}", o_text):
+            issues.append(("placeholder", "tag placeholder left in text"))
+        miss = glossary_violations(s_text, o_text, glossary)
+        if miss:
+            issues.append(("name", "missing: " + ", ".join(miss)))
+        years = [y for y in re.findall(r"\b(1[89]\d\d|20\d\d)\b", s_text) if y not in o_text]
+        if years:
+            issues.append(("number", "missing: " + ", ".join(years)))
+    return issues
+
+
+def qc_report(source_blocks: list, out_blocks: list, glossary: list, translate_cues: bool) -> list:
+    """[(index, kind, detail)] for every block with a problem."""
+    report = []
+    for i, (s, o) in enumerate(zip(source_blocks, out_blocks)):
+        for kind, detail in qc_block(s, o, glossary, translate_cues):
+            report.append((i, kind, detail))
+    return report
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# LANGUAGE LISTS & OPTIONS
+# ═══════════════════════════════════════════════════════════════════════
+
+LANGUAGES = [
     ("ar-AR",    "Arabic",                   "🇸🇦"),
     ("zh-CN",    "Chinese — Simplified",     "🇨🇳"),
     ("en-GB",    "English — UK",             "🇬🇧"),
@@ -474,44 +1108,11 @@ SOURCE_LANGUAGES = [
     ("es-LATAM", "Spanish — Latin American", "🇲🇽"),
     ("es-ES",    "Spanish — European",       "🇪🇸"),
 ]
+_LANG_LABEL = {code: label for code, label, _ in LANGUAGES}
 
-TARGET_LANGUAGES = [
-    ("ar-AR",    "Arabic",                   "🇸🇦"),
-    ("zh-CN",    "Chinese — Simplified",     "🇨🇳"),
-    ("en-GB",    "English — UK",             "🇬🇧"),
-    ("en-US",    "English — US",             "🇺🇸"),
-    ("fr-FR",    "French",                   "🇫🇷"),
-    ("de-DE",    "German",                   "🇩🇪"),
-    ("it-IT",    "Italian",                  "🇮🇹"),
-    ("ja-JP",    "Japanese",                 "🇯🇵"),
-    ("ko-KR",    "Korean",                   "🇰🇷"),
-    ("pt-BR",    "Portuguese — Brazilian",   "🇧🇷"),
-    ("pt-PT",    "Portuguese — European",    "🇵🇹"),
-    ("es-LATAM", "Spanish — Latin American", "🇲🇽"),
-    ("es-ES",    "Spanish — European",       "🇪🇸"),
-]
-
-_LANG_LABEL = {code: label for code, label, _ in SOURCE_LANGUAGES}
-
-CLAUDE_MODELS = [
-    ("claude-haiku-4-5-20251001",  "Haiku 4.5  — Fast & cheap (recommended)"),
-    ("claude-sonnet-4-5-20250929", "Sonnet 4.5 — Best quality"),
-    ("claude-sonnet-4-20250514",   "Sonnet 4   — Older, stable"),
-]
-
-BATCH_OPTIONS = [
-    (10, "10  — Conservative"),
-    (25, "25  — Recommended"),
-    (40, "40  — Fast"),
-    (50, "50  — Max throughput"),
-]
-
-WORKER_OPTIONS = [
-    (1, "1  — Safe / sequential"),
-    (3, "3  — Moderate"),
-    (5, "5  — Recommended"),
-    (8, "8  — High-rate plan only"),
-]
+BATCH_OPTIONS  = [(10, "10  — Conservative"), (25, "25  — Recommended"), (40, "40  — Fast"), (50, "50  — Max throughput")]
+WORKER_OPTIONS = [(1, "1  — Safe / sequential"), (3, "3  — Moderate"), (5, "5  — Recommended"), (8, "8  — High-rate plan only")]
+SAMPLE_BLOCKS  = 20
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -524,91 +1125,133 @@ Structure-preserving subtitle translation for .srt files.
 
 WHAT IT DOES
 ------------
-Loads a .srt subtitle file, translates all dialogue blocks into
-the chosen language, and saves a new .srt file with identical
-structure: block IDs, timestamps, and line counts are preserved.
+Loads a .srt subtitle file, translates every dialogue block into
+the chosen language, and saves a new .srt with identical structure:
+block IDs, timestamps and line counts are preserved.
 
-NEW IN v0.6.0
+NEW IN v0.7.0
 -------------
-Drag & Drop   Drag any .srt file directly onto the source file
-              area or context file area — no Browse dialog needed.
+Live models    The Claude model list is read from the API (newest
+               first) and cached for offline use. Click ↻ to refresh.
 
-Output folder The last folder used to save a translation is
-memory        remembered and used as the starting folder next time.
+Live pricing   Prices come from Anthropic's published pricing page,
+               refreshed once a day. A pricing.json file next to the
+               app overrides them; a built-in table is the fallback.
 
-Same folder   Tick the "Same folder as source" checkbox to skip
-as source     the Save dialog entirely; the output is written
-              alongside the input file automatically.
+Exact estimate The ↻ button on the cost panel counts the real input
+               tokens with the free count_tokens endpoint. The real
+               cost of each run is reported from the API usage.
 
-Context file  Optionally load a second .srt from the same
-              film/episode in another language. Claude uses it
-              to understand character names, slang and ambiguous
-              dialogue — it does NOT copy text from it.
-              Only available with the Claude API engine.
+Cues           [door slams], (laughs) and APPLAUSE lines are now
+               translated, keeping their style. Untick "Translate
+               hearing-impaired cues" to leave them as they are.
 
-Encoding info The detected file encoding (UTF-8, Latin-1, etc.)
-              is shown next to the block count after loading.
+Quality control Each block is checked after the run: unchanged text,
+               missing lines, lost tags and missing names are flagged.
+               Unchanged blocks are retranslated once automatically.
+               The QC report appears in the Activity Log and flagged
+               blocks are highlighted in the Comparison tab.
 
-Cost estimate A live cost panel shows the estimated API cost for
-              the loaded file based on current pricing. Rates are
-              hardcoded from Anthropic's published prices and
-              verified against the API on first key use.
+Preserve names Type names one per line (people, schools, companies,
+               places). "Auto-detect" asks Claude to list them from
+               the file for you to review. A <file>.names.txt next to
+               the subtitle is loaded automatically and can be saved
+               with "Save next to SRT".
 
-ENCODING SUPPORT
-----------------
-The app automatically detects character encoding (UTF-8, Latin-1,
-ISO-8859-1, Windows-1252, etc.). Output is always UTF-8 + BOM.
+Context file   Only the context lines around each batch (by timestamp)
+               are sent, so the extra cost is small.
+
+Sample run     Translates the first {SAMPLE_BLOCKS} blocks only, without saving,
+               and shows the result and its real cost.
+
+Output name    Movie.en.srt → Movie.pt-BR.srt (source tag removed).
 
 TRANSLATION ENGINES
 -------------------
 Claude API (recommended)
-  Uses Anthropic's Claude AI. Requires an API key from
-  console.anthropic.com. Understands tone, humor, slang, and
-  cultural context. Context file support enabled.
-
-  Models:
-  Haiku 4.5   $1/$5 per MTok. Fast, cheap. Recommended.
-  Sonnet 4.5  $3/$15 per MTok. Higher quality.
-  Sonnet 4    $3/$15 per MTok. Older, stable.
+  Requires an API key from console.anthropic.com. Understands tone,
+  humour, slang and context. Supports context files, name
+  preservation and quality control.
 
 MyMemory (free)
-  Free API, no key required. Literal, less nuanced. Good for
-  testing. Context file not available for this engine.
+  No key required. Literal, less nuanced. Good for testing.
 
 API KEY
 -------
-Stored locally in ~/.srt_translator_config.json. Never sent
-anywhere other than api.anthropic.com.
+Stored locally in ~/.srt_translator_config.json. Sent only to
+api.anthropic.com. Set the ANTHROPIC_API_KEY environment variable
+as an alternative.
 
-COST ESTIMATES
---------------
-Estimated cost is shown before you start. Actual cost depends on
-exact token counts which vary by line length and batch content.
-Estimates use: ~3.5 chars per token, 1.15× output multiplier,
-plus system prompt overhead per batch.
-
-Pricing verified May 2026 from Anthropic's published rates.
-Update the _FALLBACK_PRICES dict at the top of the script if
-rates change.
-
-BATCH SIZE
-----------
-Blocks sent per API call. Auto-suggested based on avg line length.
-  Conservative (10-15)  Dense narration / documentary
-  Recommended  (25-40)  Standard film and TV
-  Fast         (50)     Short conversational lines
-
-PARALLEL WORKERS
-----------------
-Simultaneous API calls. Higher = faster, more rate-limit risk.
-  1   Safe / sequential      5   Recommended
-  3   Moderate               8   High-rate plan only
+BATCH SIZE & WORKERS
+--------------------
+Batch size = blocks per API call (auto-suggested from line length).
+Workers = simultaneous API calls. Higher is faster but can hit
+rate limits; the app retries automatically.
 
 RIGHT-PANEL TABS
 ----------------
 Source Preview   First 50 blocks, verify parse before starting.
-Comparison       Side-by-side original vs translated (60 blocks).
-Activity Log     Real-time batch progress + verification report.
+Comparison       Original vs translated, QC-flagged blocks in colour.
+Activity Log     Batch progress, QC report, real cost.
+"""
+
+
+ENGINE_HELP_TEXT = """\
+TRANSLATION ENGINES
+-------------------
+The app can translate with two different services. Pick one in
+section 06. Everything else (file loading, structure checks,
+output naming) works the same way for both.
+
+CLAUDE API  (recommended)
+-------------------------
+What it is   Anthropic's Claude language models, called through
+             your own API key from console.anthropic.com.
+
+How it works The subtitle is cut into batches of blocks (section
+             "Batch size"). Each batch is sent with instructions
+             about tone, names and line structure; several batches
+             run at the same time ("Parallel workers"). The reply
+             is checked block by block, anything missing or
+             unchanged is sent again, and the real cost is reported.
+
+Quality      Understands context, humour, slang, register and
+             hearing-impaired cues. Keeps names from the Preserve
+             list. Can use a context file in another language.
+
+Cost         Pay per token. The estimate panel shows the price
+             before you start; a 90-minute film costs a few cents
+             with Haiku 5.5 and well under a dollar with the
+             larger models. Prices come from Anthropic's pricing
+             page and are refreshed daily.
+
+Needs        An API key (Edit button) and an internet connection.
+             The key is stored only on this computer.
+
+MYMEMORY  (free)
+----------------
+What it is   A public translation-memory service
+             (mymemory.translated.net) with a free web API.
+
+How it works Each subtitle line is sent on its own, one at a
+             time, with no context from the lines around it.
+             Lines that fail are kept in the original language.
+
+Quality      Literal, phrase-by-phrase. Good for a quick test or
+             for very simple dialogue; names, jokes and idioms
+             are often translated word for word.
+
+Cost         Free, no key. The service limits anonymous use to a
+             few thousand characters per day, so long films may
+             stop part-way; wait a day or use Claude.
+
+Limits       No context file, no name preservation, no quality-
+             control repair pass, slower (one request per line).
+
+WHICH ONE?
+----------
+Use Claude for anything you will actually watch. Use MyMemory to
+try the app without an account or to check that a file parses.
 """
 
 
@@ -616,35 +1259,32 @@ Activity Log     Real-time batch progress + verification report.
 # DRAG-AND-DROP HELPER
 # ═══════════════════════════════════════════════════════════════════════
 
-def _try_enable_dnd(widget, callback):
-    """
-    Enable drag-and-drop on widget if tkinterdnd2 is available.
-    Falls back to a no-op so the app works without it.
-    Returns True if DnD was successfully enabled.
-    """
+def _try_enable_dnd(widget, callback, on_enter=None, on_leave=None) -> bool:
     try:
         import tkinterdnd2 as dnd  # type: ignore
+        # Load the tkdnd Tcl package into this interpreter. A plain tk.Tk() root never
+        # does it, so without this call drop_target_register fails and DnD stays off.
+        dnd.TkinterDnD.require(widget.winfo_toplevel())
         widget.drop_target_register(dnd.DND_FILES)
-        widget.dnd_bind('<<Drop>>', lambda e: callback(_clean_dnd_path(e.data)))
+        widget.dnd_bind("<<Drop>>", lambda e: callback(_clean_dnd_path(e.data)))
+        if on_enter:
+            widget.dnd_bind("<<DragEnter>>", lambda e: on_enter())
+        if on_leave:
+            widget.dnd_bind("<<DragLeave>>", lambda e: on_leave())
         return True
     except Exception:
         return False
 
 
 def _clean_dnd_path(raw: str) -> str:
-    """Normalise a raw drop event path (handles braces from Windows/Linux)."""
     raw = raw.strip()
-    if raw.startswith('{') and raw.endswith('}'):
+    if raw.startswith("{") and raw.endswith("}"):
         raw = raw[1:-1]
-    # On Windows paths can be URL-encoded
-    try:
+    if raw.startswith("file:///"):
         from urllib.parse import unquote
-        if raw.startswith('file:///'):
-            raw = unquote(raw[8:])
-            if not raw.startswith('/'):
-                raw = '/' + raw   # Linux absolute paths
-    except Exception:
-        pass
+        raw = unquote(raw[8:])
+        if not re.match(r"^[A-Za-z]:", raw):
+            raw = "/" + raw
     return raw
 
 
@@ -656,59 +1296,100 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1060x800")
-        self.minsize(900, 680)
+        self.geometry("1100x840")
+        self.minsize(940, 700)
         self.configure(bg=COLORS["bg_dark"])
-        self.resizable(True, True)
 
-        _cfg = load_config()
+        cfg = load_config()
+        self.catalog = Catalog(cfg)
 
         # State
         self.source_blocks     = []
         self.translated_blocks = []
-        self.context_blocks    = []         # v0.6.0: context file
+        self.context_blocks    = []
+        self.qc_issues         = []
         self.input_path        = ""
         self.context_path      = ""
         self.output_path       = ""
-        self._last_output_dir  = _cfg.get('last_output_dir', '')   # v0.6.0
+        self._last_output_dir  = cfg.get("last_output_dir", "")
+        self._api_key          = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+        self._bg_tasks         = 0
 
-        # StringVars / IntVars
-        self.source_lang       = tk.StringVar(value=_cfg.get('source_lang', 'en-US'))
-        self.target_lang       = tk.StringVar(value=_cfg.get('target_lang', 'pt-BR'))
-        self.engine            = tk.StringVar(value=_cfg.get('engine', 'claude'))
-        self.claude_model      = tk.StringVar(value=_cfg.get('claude_model', 'claude-haiku-4-5-20251001'))
-        self.same_folder       = tk.BooleanVar(value=_cfg.get('same_folder', False))  # v0.6.0
-        self.is_translating    = False
-        self.cancel_flag       = False
-        self.progress_var      = tk.DoubleVar(value=0)
-        self.status_text       = tk.StringVar(value="Ready")
-        self.batch_size        = tk.IntVar(value=int(_cfg.get('batch_size', 25)))
-        self.workers           = tk.IntVar(value=int(_cfg.get('workers', 5)))
+        # Vars
+        self.source_lang    = tk.StringVar(value=cfg.get("source_lang", "en-US"))
+        self.target_lang    = tk.StringVar(value=cfg.get("target_lang", "pt-BR"))
+        self.engine         = tk.StringVar(value=cfg.get("engine", "claude"))
+        self.claude_model   = tk.StringVar(value=self.catalog.pick_default(cfg.get("claude_model", "")))
+        self.same_folder    = tk.BooleanVar(value=cfg.get("same_folder", False))
+        self.translate_cues = tk.BooleanVar(value=cfg.get("translate_cues", True))
+        self.batch_size     = tk.IntVar(value=int(cfg.get("batch_size", 25)))
+        self.workers        = tk.IntVar(value=int(cfg.get("workers", 5)))
+        self.progress_var   = tk.DoubleVar(value=0)
+        self.status_text    = tk.StringVar(value="Ready")
+        self.is_translating = False
+        self.cancel_flag    = False
+        self._initial_glossary = cfg.get("glossary", "")
 
-        self._api_key = _cfg.get('api_key') or os.environ.get('ANTHROPIC_API_KEY', '')
-
+        self._ui_queue = queue.Queue()
         self._build_ui()
-        self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(40, self._drain_ui_queue)
 
-        # Trigger cost estimate refresh when model changes
         self.claude_model.trace_add("write", lambda *_: self._refresh_cost())
-        self.engine.trace_add("write", lambda *_: self._refresh_cost())
+        self.target_lang.trace_add("write", lambda *_: self._refresh_cost())
+        self.translate_cues.trace_add("write", lambda *_: self._refresh_cost())
+        self.batch_size.trace_add("write", lambda *_: self._refresh_cost())
+
+        self.after(300, self._startup_refresh)
+
+    # ── Cross-thread UI updates ──────────────────────────────────────
+
+    def _post(self, fn):
+        """Run fn on the Tk main thread (safe to call from worker threads)."""
+        self._ui_queue.put(fn)
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        try:
+            self.after(40, self._drain_ui_queue)
+        except tk.TclError:
+            pass
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
     def _on_close(self):
         save_config({
-            'api_key':         self._api_key,
-            'claude_model':    self.claude_model.get(),
-            'source_lang':     self.source_lang.get(),
-            'target_lang':     self.target_lang.get(),
-            'engine':          self.engine.get(),
-            'batch_size':      self.batch_size.get(),
-            'workers':         self.workers.get(),
-            'same_folder':     self.same_folder.get(),
-            'last_output_dir': self._last_output_dir,
+            "api_key":         self._api_key,
+            "claude_model":    self.claude_model.get(),
+            "source_lang":     self.source_lang.get(),
+            "target_lang":     self.target_lang.get(),
+            "engine":          self.engine.get(),
+            "batch_size":      self.batch_size.get(),
+            "workers":         self.workers.get(),
+            "same_folder":     self.same_folder.get(),
+            "translate_cues":  self.translate_cues.get(),
+            "last_output_dir": self._last_output_dir,
+            "glossary":        self._glossary_text(),
         })
         self.destroy()
+
+    def _startup_refresh(self):
+        """Refresh models (needs key) and prices in the background when stale."""
+        self._log(f"Models: {len(self.catalog.models)} ({self.catalog.models_source})  •  "
+                  f"Prices: {self.catalog.prices_source}"
+                  + ("  •  pricing.json override active" if self.catalog.override else ""), "info")
+        if self.catalog.override:
+            self._log(f"Price override file: {PRICING_OVERRIDE_PATH}", "info")
+        if self.catalog.prices_stale() or (self.catalog.models_stale() and self._api_key.strip()):
+            self._refresh_catalog(force=False)
 
     # ── UI Build ─────────────────────────────────────────────────────
 
@@ -716,19 +1397,14 @@ class App(tk.Tk):
         hdr = tk.Frame(self, bg=COLORS["bg_mid"], height=52)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-        tk.Label(hdr, text=f"◈  {APP_TITLE}",
-                 font=FONTS["title"], fg=COLORS["accent"], bg=COLORS["bg_mid"],
-                 padx=20).pack(side="left", pady=10)
-        tk.Button(hdr, text="?  Help", font=FONTS["small"],
-                  bg=COLORS["bg_input"], fg=COLORS["text_dim"], relief="flat",
-                  activebackground=COLORS["border"], activeforeground=COLORS["text_bright"],
-                  cursor="hand2", padx=12, pady=4,
-                  command=self._show_help).pack(side="right", padx=16, pady=10)
+        tk.Label(hdr, text=f"◈  {APP_TITLE}", font=FONTS["title"], fg=COLORS["accent"],
+                 bg=COLORS["bg_mid"], padx=20).pack(side="left", pady=10)
+        self._flat_btn(hdr, "?  Help", self._show_help, dim=True).pack(side="right", padx=16, pady=10)
 
         body = tk.Frame(self, bg=COLORS["bg_dark"])
         body.pack(fill="both", expand=True, padx=16, pady=12)
 
-        left = tk.Frame(body, bg=COLORS["bg_card"], width=450,
+        left = tk.Frame(body, bg=COLORS["bg_card"], width=470,
                         highlightbackground=COLORS["border"], highlightthickness=1)
         left.pack(side="left", fill="y", padx=(0, 10))
         left.pack_propagate(False)
@@ -743,294 +1419,430 @@ class App(tk.Tk):
         ftr.pack_propagate(False)
         self._build_footer(ftr)
 
+    def _flat_btn(self, parent, text, cmd, primary=False, danger=False, dim=False, font=None, **kw):
+        bg = COLORS["btn_primary"] if primary else COLORS["btn_danger"] if danger else COLORS["bg_input"]
+        fg = "#ffffff" if (primary or danger) else COLORS["text_dim"] if dim else COLORS["text"]
+        return tk.Button(parent, text=text, font=font or FONTS["small"], bg=bg, fg=fg, relief="flat",
+                         activebackground=COLORS["btn_hover"] if primary else COLORS["border"],
+                         activeforeground=COLORS["text_bright"], cursor="hand2",
+                         padx=kw.pop("padx", 12), pady=kw.pop("pady", 4), command=cmd, **kw)
+
     def _build_left(self, parent):
         canvas = tk.Canvas(parent, bg=COLORS["bg_card"], highlightthickness=0)
         sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         sf = tk.Frame(canvas, bg=COLORS["bg_card"])
         sf.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=sf, anchor="nw", width=440)
+        canvas.create_window((0, 0), window=sf, anchor="nw", width=460)
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+        # Mouse wheel only while the pointer is over the left panel
+        def _wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         p = {"padx": 16}
         f = sf
 
-        # ── 01 Source file ───────────────────────────────────────────
         self._sec(f, "01", "SOURCE FILE")
         self._build_source_file_area(f, p)
 
-        # ── 02 Context file (Claude only) ────────────────────────────
         self._sec(f, "02", "CONTEXT FILE  (optional, Claude API only)")
         self._build_context_file_area(f, p)
 
-        # ── 03 Output destination ────────────────────────────────────
         self._sec(f, "03", "OUTPUT DESTINATION")
         self._build_output_options(f, p)
 
-        # ── 04 Source language ───────────────────────────────────────
         self._sec(f, "04", "SOURCE LANGUAGE")
-        self._build_src_dropdown(f, p)
-        tk.Label(f, text="Auto-detected from file. Adjust if incorrect.",
-            font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w"
-            ).pack(fill="x", **p, pady=(2, 8))
+        self._src_combo, self._src_codes, self._src_combo_var = \
+            self._make_dropdown(f, p, self.source_lang)
+        self._hint(f, "Auto-detected from file. Adjust if incorrect.", p)
 
-        # ── 05 Target language ───────────────────────────────────────
         self._sec(f, "05", "TARGET LANGUAGE")
-        self._build_tgt_dropdown(f, p)
-        tk.Label(f, text="Last selection remembered between sessions.",
-            font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w"
-            ).pack(fill="x", **p, pady=(2, 8))
+        # keep the references: a discarded StringVar is garbage-collected and the box goes blank
+        self._tgt_combo, self._tgt_codes, self._tgt_combo_var = \
+            self._make_dropdown(f, p, self.target_lang)
+        self._hint(f, "Last selection remembered between sessions.", p)
 
-        # ── 06 Engine ────────────────────────────────────────────────
-        self._sec(f, "06", "TRANSLATION ENGINE")
-        eng = tk.Frame(f, bg=COLORS["bg_card"])
-        eng.pack(fill="x", **p, pady=(0, 4))
-        self._eng_btn(eng, "claude", "Claude API", "RECOMMENDED", COLORS["success"],
-                      "Best quality — tone, humor, cultural nuances")
-        self._eng_btn(eng, "free",   "MyMemory",  "FREE",        COLORS["accent2"],
-                      "No API key — literal, less nuanced")
+        self._sec(f, "06", "TRANSLATION ENGINE", help_cmd=self._show_engine_help)
+        self._eng_frame = tk.Frame(f, bg=COLORS["bg_card"])
+        self._eng_frame.pack(fill="x", **p, pady=(0, 4))
+        self._eng_cards = {}
+        self._eng_card("claude", "Claude API", "RECOMMENDED", COLORS["success"],
+                       "Best quality — tone, humour, names, cues, quality control")
+        self._eng_card("free", "MyMemory", "FREE", COLORS["accent2"],
+                       "No API key — literal, less nuanced")
+        self.engine.trace_add("write", self._on_engine_change)
 
         self.claude_frame = tk.Frame(f, bg=COLORS["bg_card"])
         self.claude_frame.pack(fill="x", **p, pady=(4, 4))
         self._build_claude_options(self.claude_frame)
 
-        self.engine.trace_add("write", self._on_engine_change)
+        tk.Checkbutton(f, text="Translate hearing-impaired cues  [door slams]  (laughs)  APPLAUSE",
+                       variable=self.translate_cues, font=FONTS["tiny"], fg=COLORS["text"],
+                       bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
+                       activebackground=COLORS["bg_card"], anchor="w", cursor="hand2"
+                       ).pack(fill="x", **p, pady=(2, 0))
+
+        self._sec(f, "07", "PRESERVE NAMES  (never translated)")
+        self._build_glossary_area(f, p)
+
         self._on_engine_change()
 
         # Action buttons
-        tk.Frame(f, bg=COLORS["bg_card"], height=8).pack(fill="x")
         bf = tk.Frame(f, bg=COLORS["bg_card"])
-        bf.pack(fill="x", **p, pady=(0, 16))
-        self.start_btn = tk.Button(bf, text="▶  Start Translation",
-            font=FONTS["heading"], bg=COLORS["btn_primary"], fg="#ffffff", relief="flat",
-            activebackground=COLORS["btn_hover"], activeforeground="#ffffff",
-            cursor="hand2", pady=10, command=self._start)
+        bf.pack(fill="x", **p, pady=(12, 16))
+        self.start_btn = tk.Button(bf, text="▶  Start Translation", font=FONTS["heading"],
+                                   bg=COLORS["btn_primary"], fg="#ffffff", relief="flat",
+                                   activebackground=COLORS["btn_hover"], activeforeground="#ffffff",
+                                   cursor="hand2", pady=10, command=lambda: self._start(sample=False))
         self.start_btn.pack(fill="x", pady=(0, 6))
-        self.cancel_btn = tk.Button(bf, text="✕  Cancel",
-            font=FONTS["body"], bg=COLORS["btn_danger"], fg="#ffffff", relief="flat",
-            cursor="hand2", pady=6, state="disabled", command=self._cancel)
-        self.cancel_btn.pack(fill="x")
+        row = tk.Frame(bf, bg=COLORS["bg_card"])
+        row.pack(fill="x")
+        self.sample_btn = self._flat_btn(row, f"◐  Sample ({SAMPLE_BLOCKS} blocks)",
+                                         lambda: self._start(sample=True), pady=6)
+        self.sample_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.cancel_btn = self._flat_btn(row, "✕  Cancel", self._cancel, danger=True, pady=6)
+        self.cancel_btn.configure(state="disabled")
+        self.cancel_btn.pack(side="left", fill="x", expand=True, padx=(3, 0))
 
-    # ── Source file area (with drop zone) ────────────────────────────
+    def _hint(self, parent, text, p, color=None):
+        lbl = tk.Label(parent, text=text, font=FONTS["tiny"], fg=color or COLORS["text_dim"],
+                       bg=COLORS["bg_card"], anchor="w", justify="left", wraplength=420)
+        lbl.pack(fill="x", **p, pady=(2, 8))
+        return lbl
+
+    # ── Source / context / output areas ──────────────────────────────
+
+    def _drop_zone(self, parent, p, text, browse_cmd, load_cmd, small=False):
+        zone = tk.Frame(parent, bg=COLORS["bg_input"], highlightbackground=COLORS["border"],
+                        highlightthickness=1, cursor="hand2")
+        zone.pack(fill="x", **p, pady=(0, 4))
+        inner = tk.Frame(zone, bg=COLORS["bg_input"])
+        inner.pack(fill="x", padx=10, pady=6 if small else 8)
+        label = tk.Label(inner, text=text, font=FONTS["tiny"] if small else FONTS["small"],
+                         fg=COLORS["text_dim"], bg=COLORS["bg_input"], anchor="w", cursor="hand2")
+        label.pack(side="left", fill="x", expand=True)
+        zone.bind("<Button-1>", lambda e: browse_cmd())
+        label.bind("<Button-1>", lambda e: browse_cmd())
+        _try_enable_dnd(zone, load_cmd,
+                        on_enter=lambda: zone.configure(highlightbackground=COLORS["accent"], bg=COLORS["drop_active"]),
+                        on_leave=lambda: zone.configure(highlightbackground=COLORS["border"], bg=COLORS["bg_input"]))
+        return zone, inner, label
 
     def _build_source_file_area(self, parent, p):
-        # Drop zone frame
-        self._src_drop = tk.Frame(parent,
-            bg=COLORS["bg_input"],
-            highlightbackground=COLORS["border"], highlightthickness=1,
-            cursor="hand2")
-        self._src_drop.pack(fill="x", **p, pady=(0, 4))
-
-        inner = tk.Frame(self._src_drop, bg=COLORS["bg_input"])
-        inner.pack(fill="x", padx=10, pady=8)
-
-        self.file_label = tk.Label(inner, text="Drop .srt here  or  Browse…",
-            font=FONTS["small"], fg=COLORS["text_dim"], bg=COLORS["bg_input"],
-            anchor="w", cursor="hand2")
-        self.file_label.pack(side="left", fill="x", expand=True)
-
-        tk.Button(inner, text="Browse…", font=FONTS["small"],
-            bg=COLORS["bg_card"], fg=COLORS["text"], relief="flat",
-            activebackground=COLORS["border"], activeforeground=COLORS["text_bright"],
-            cursor="hand2", padx=12, pady=3,
-            command=self._browse).pack(side="right")
-
-        self.file_info = tk.Label(parent, text="", font=FONTS["tiny"],
-            fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w")
+        self._src_drop, inner, self.file_label = self._drop_zone(
+            parent, p, "Drop .srt here  or  Browse…", self._browse, self._load_source_file)
+        self._flat_btn(inner, "Browse…", self._browse, pady=3).pack(side="right")
+        self.file_info = tk.Label(parent, text="", font=FONTS["tiny"], fg=COLORS["text_dim"],
+                                  bg=COLORS["bg_card"], anchor="w")
         self.file_info.pack(fill="x", **p, pady=(0, 1))
-        self.batch_hint = tk.Label(parent, text="", font=FONTS["tiny"],
-            fg=COLORS["accent"], bg=COLORS["bg_card"], anchor="w")
+        self.batch_hint = tk.Label(parent, text="", font=FONTS["tiny"], fg=COLORS["accent"],
+                                   bg=COLORS["bg_card"], anchor="w")
         self.batch_hint.pack(fill="x", **p, pady=(0, 8))
 
-        # Bind click on the drop zone frame
-        self._src_drop.bind("<Button-1>", lambda e: self._browse())
-        self.file_label.bind("<Button-1>", lambda e: self._browse())
-
-        # Drag-and-drop
-        dnd_ok = _try_enable_dnd(self._src_drop, self._load_source_file)
-        if dnd_ok:
-            # Highlight on hover
-            try:
-                import tkinterdnd2 as dnd  # type: ignore
-                self._src_drop.dnd_bind('<<DragEnter>>',
-                    lambda e: self._src_drop.configure(
-                        highlightbackground=COLORS["accent"], bg=COLORS["drop_active"]))
-                self._src_drop.dnd_bind('<<DragLeave>>',
-                    lambda e: self._src_drop.configure(
-                        highlightbackground=COLORS["border"], bg=COLORS["bg_input"]))
-            except Exception:
-                pass
-
-    # ── Context file area (with drop zone) ───────────────────────────
-
     def _build_context_file_area(self, parent, p):
-        self._ctx_drop = tk.Frame(parent,
-            bg=COLORS["bg_input"],
-            highlightbackground=COLORS["border"], highlightthickness=1,
-            cursor="hand2")
-        self._ctx_drop.pack(fill="x", **p, pady=(0, 2))
-
-        inner = tk.Frame(self._ctx_drop, bg=COLORS["bg_input"])
-        inner.pack(fill="x", padx=10, pady=6)
-
-        self._ctx_label = tk.Label(inner, text="Drop context .srt here  or  Browse…",
-            font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_input"],
-            anchor="w", cursor="hand2")
-        self._ctx_label.pack(side="left", fill="x", expand=True)
-
-        self._ctx_clear_btn = tk.Button(inner, text="✕", font=FONTS["tiny"],
-            bg=COLORS["bg_input"], fg=COLORS["error"], relief="flat",
-            cursor="hand2", padx=6,
-            command=self._clear_context)
-        self._ctx_clear_btn.pack(side="right")
-        self._ctx_clear_btn.pack_forget()  # hidden until a file is loaded
-
-        ctx_browse_btn = tk.Button(inner, text="Browse…", font=FONTS["tiny"],
-            bg=COLORS["bg_card"], fg=COLORS["text"], relief="flat",
-            activebackground=COLORS["border"], activeforeground=COLORS["text_bright"],
-            cursor="hand2", padx=10, pady=2,
-            command=self._browse_context)
-        ctx_browse_btn.pack(side="right", padx=(0, 4))
-
-        self._ctx_info = tk.Label(parent,
-            text="Helps Claude understand dialogue. Stripped of all timestamps/IDs.",
-            font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w")
-        self._ctx_info.pack(fill="x", **p, pady=(0, 8))
-
-        self._ctx_drop.bind("<Button-1>", lambda e: self._browse_context())
-        self._ctx_label.bind("<Button-1>", lambda e: self._browse_context())
-
-        _try_enable_dnd(self._ctx_drop, self._load_context_file)
-
-    # ── Output destination options ────────────────────────────────────
+        self._ctx_drop, inner, self._ctx_label = self._drop_zone(
+            parent, p, "Drop context .srt here  or  Browse…", self._browse_context,
+            self._load_context_file, small=True)
+        self._ctx_clear_btn = tk.Button(inner, text="✕", font=FONTS["tiny"], bg=COLORS["bg_input"],
+                                        fg=COLORS["error"], relief="flat", cursor="hand2", padx=6,
+                                        command=self._clear_context)
+        self._flat_btn(inner, "Browse…", self._browse_context, font=FONTS["tiny"], padx=10, pady=2
+                       ).pack(side="right", padx=(0, 4))
+        self._hint(parent, "Same film in another language. Only the lines around each batch "
+                           "(by timestamp) are sent, so the extra cost is small.", p)
 
     def _build_output_options(self, parent, p):
         of = tk.Frame(parent, bg=COLORS["bg_card"])
         of.pack(fill="x", **p, pady=(0, 8))
-
-        self._same_folder_cb = tk.Checkbutton(of,
-            text="Save in same folder as source file (skip Save dialog)",
-            variable=self.same_folder,
-            font=FONTS["tiny"], fg=COLORS["text"], bg=COLORS["bg_card"],
-            selectcolor=COLORS["bg_input"], activebackground=COLORS["bg_card"],
-            anchor="w", cursor="hand2")
-        self._same_folder_cb.pack(fill="x")
-
-        self._last_dir_label = tk.Label(of,
-            text=self._last_dir_display(),
-            font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w")
+        tk.Checkbutton(of, text="Save in same folder as source file (skip Save dialog)",
+                       variable=self.same_folder, font=FONTS["tiny"], fg=COLORS["text"],
+                       bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
+                       activebackground=COLORS["bg_card"], anchor="w", cursor="hand2").pack(fill="x")
+        self._last_dir_label = tk.Label(of, text=self._last_dir_display(), font=FONTS["tiny"],
+                                        fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w")
         self._last_dir_label.pack(fill="x", pady=(2, 0))
+        self._out_name_label = tk.Label(of, text="", font=FONTS["tiny"], fg=COLORS["text_dim"],
+                                        bg=COLORS["bg_card"], anchor="w")
+        self._out_name_label.pack(fill="x", pady=(2, 0))
+        self.target_lang.trace_add("write", lambda *_: self._update_out_name())
 
     def _last_dir_display(self) -> str:
         d = self._last_output_dir
         if not d:
             return "Last output folder: (none yet)"
-        short = d if len(d) <= 48 else "…" + d[-45:]
-        return f"Last output folder: {short}"
+        return "Last output folder: " + (d if len(d) <= 48 else "…" + d[-45:])
 
-    # ── Cost estimate panel ───────────────────────────────────────────
+    def _update_out_name(self):
+        if self.input_path:
+            self._out_name_label.configure(
+                text="Output name: " + default_output_name(self.input_path, self.target_lang.get()))
+
+    # ── Claude options ───────────────────────────────────────────────
+
+    def _build_claude_options(self, parent):
+        tk.Label(parent, text="Claude API Key", font=FONTS["small"], fg=COLORS["text_dim"],
+                 bg=COLORS["bg_card"], anchor="w").pack(fill="x")
+        key_row = tk.Frame(parent, bg=COLORS["bg_card"])
+        key_row.pack(fill="x", pady=(4, 0))
+        self.key_display = tk.Label(key_row, text=self._mask_key(self._api_key), font=FONTS["mono_sm"],
+                                    bg=COLORS["key_bg"], fg=COLORS["text_dim"], anchor="w", padx=8, pady=5,
+                                    highlightbackground=COLORS["border"], highlightthickness=1)
+        self.key_display.pack(side="left", fill="x", expand=True)
+        self._flat_btn(key_row, "✎  Edit", self._edit_key, dim=True, font=FONTS["tiny"], padx=10, pady=5
+                       ).pack(side="right", padx=(6, 0))
+
+        # Model
+        mrow = tk.Frame(parent, bg=COLORS["bg_card"])
+        mrow.pack(fill="x", pady=(10, 2))
+        tk.Label(mrow, text="Claude Model", font=FONTS["small"], fg=COLORS["text_dim"],
+                 bg=COLORS["bg_card"], anchor="w").pack(side="left")
+        self._models_status = tk.Label(mrow, text="", font=FONTS["tiny"], fg=COLORS["text_dim"],
+                                       bg=COLORS["bg_card"], anchor="e")
+        self._models_status.pack(side="right")
+        mr2 = tk.Frame(parent, bg=COLORS["bg_card"])
+        mr2.pack(fill="x")
+        self._model_combo_var = tk.StringVar()
+        self._model_combo = ttk.Combobox(mr2, textvariable=self._model_combo_var, state="readonly",
+                                         style="Lang.TCombobox", font=FONTS["tiny"])
+        self._model_combo.pack(side="left", fill="x", expand=True, ipady=3)
+        self._model_combo.bind("<<ComboboxSelected>>", self._on_model_selected)
+        self._flat_btn(mr2, "↻", lambda: self._refresh_catalog(force=True), dim=True,
+                       font=FONTS["small"], padx=8, pady=2).pack(side="right", padx=(6, 0))
+        self._fill_model_combo()
+
+        self._build_cost_panel(parent)
+
+        for title, var, options in (("Batch size  (blocks per API call)", self.batch_size, BATCH_OPTIONS),
+                                    ("Parallel workers  (concurrent API calls)", self.workers, WORKER_OPTIONS)):
+            tk.Label(parent, text=title, font=FONTS["small"], fg=COLORS["text_dim"],
+                     bg=COLORS["bg_card"], anchor="w").pack(fill="x", pady=(10, 2))
+            row = tk.Frame(parent, bg=COLORS["bg_card"])
+            row.pack(fill="x")
+            for val, lbl in options:
+                tk.Radiobutton(row, text=lbl.split("—")[0].strip(), variable=var, value=val,
+                               font=FONTS["tiny"], fg=COLORS["text"], bg=COLORS["bg_card"],
+                               selectcolor=COLORS["bg_input"], activebackground=COLORS["bg_card"],
+                               anchor="w").pack(side="left", padx=(4, 10))
+
+    def _fill_model_combo(self):
+        self._model_ids = [m["id"] for m in self.catalog.models]
+        values = [self.catalog.label(mid) for mid in self._model_ids]
+        self._model_combo.configure(values=values)
+        cur = self.catalog.pick_default(self.claude_model.get())
+        if cur != self.claude_model.get():
+            self.claude_model.set(cur)
+        idx = self._model_ids.index(cur) if cur in self._model_ids else 0
+        if values:
+            self._model_combo_var.set(values[idx])
+        when = (datetime.fromtimestamp(self.catalog.models_fetched_at).strftime("%d %b %H:%M")
+                if self.catalog.models_fetched_at else "never")
+        self._models_status.configure(
+            text=f"{len(self._model_ids)} models · {self.catalog.models_source} · updated {when}")
+
+    def _on_model_selected(self, event=None):
+        idx = self._model_combo.current()
+        if 0 <= idx < len(self._model_ids):
+            self.claude_model.set(self._model_ids[idx])
+
+    def _refresh_catalog(self, force: bool):
+        """Background: refresh prices (always) and models (if key). Then rebuild UI."""
+        def work():
+            msgs = []
+            if force or self.catalog.prices_stale():
+                ok = self.catalog.refresh_prices()
+                msgs.append("prices updated from anthropic.com" if ok else "price fetch failed (using cached/built-in)")
+            if self._api_key.strip() and (force or self.catalog.models_stale()):
+                try:
+                    self.catalog.refresh_models(self._api_key)
+                    msgs.append(f"{len(self.catalog.models)} models read from the API")
+                except Exception as e:
+                    msgs.append(f"model list fetch failed: {_err(e)}")
+            elif not self._api_key.strip():
+                msgs.append("no API key — model list not refreshed")
+
+            def done():
+                self._fill_model_combo()
+                self._refresh_cost()
+                self._log("Catalog: " + "; ".join(msgs), "info")
+            self._post(done)
+        self._models_status.configure(text="refreshing…")
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── Cost panel ───────────────────────────────────────────────────
 
     def _build_cost_panel(self, parent):
-        """Build the cost estimate card shown in the Claude options area."""
-        self._cost_frame = tk.Frame(parent,
-            bg=COLORS["key_bg"],
-            highlightbackground=COLORS["border"], highlightthickness=1)
+        self._cost_frame = tk.Frame(parent, bg=COLORS["key_bg"], highlightbackground=COLORS["border"],
+                                    highlightthickness=1)
         self._cost_frame.pack(fill="x", pady=(10, 2))
-
         hdr = tk.Frame(self._cost_frame, bg=COLORS["key_bg"])
         hdr.pack(fill="x", padx=10, pady=(6, 2))
-        tk.Label(hdr, text="ESTIMATED COST", font=FONTS["badge"],
-                 fg=COLORS["accent"], bg=COLORS["key_bg"]).pack(side="left")
-        self._cost_refresh_btn = tk.Button(hdr, text="↻", font=FONTS["tiny"],
-            bg=COLORS["key_bg"], fg=COLORS["text_dim"], relief="flat",
-            cursor="hand2", padx=4,
-            command=self._refresh_cost)
-        self._cost_refresh_btn.pack(side="right")
-
-        self._cost_main = tk.Label(self._cost_frame,
-            text="Load a file to see estimate",
-            font=("Consolas", 12, "bold"), fg=COLORS["text_dim"],
-            bg=COLORS["key_bg"], anchor="w", padx=10)
+        tk.Label(hdr, text="ESTIMATED COST", font=FONTS["badge"], fg=COLORS["accent"],
+                 bg=COLORS["key_bg"]).pack(side="left")
+        self._cost_method = tk.Label(hdr, text="", font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["key_bg"])
+        self._cost_method.pack(side="left", padx=8)
+        tk.Button(hdr, text="↻ exact", font=FONTS["tiny"], bg=COLORS["key_bg"], fg=COLORS["text_dim"],
+                  relief="flat", cursor="hand2", padx=4,
+                  command=lambda: self._refresh_cost(exact=True)).pack(side="right")
+        self._cost_main = tk.Label(self._cost_frame, text="Load a file to see estimate",
+                                   font=("Consolas", 12, "bold"), fg=COLORS["text_dim"],
+                                   bg=COLORS["key_bg"], anchor="w", padx=10)
         self._cost_main.pack(fill="x")
-
-        self._cost_detail = tk.Label(self._cost_frame,
-            text="", font=FONTS["tiny"], fg=COLORS["text_dim"],
-            bg=COLORS["key_bg"], anchor="w", padx=10, justify="left")
+        self._cost_detail = tk.Label(self._cost_frame, text="", font=FONTS["tiny"], fg=COLORS["text_dim"],
+                                     bg=COLORS["key_bg"], anchor="w", padx=10, justify="left")
         self._cost_detail.pack(fill="x", pady=(0, 6))
 
-    def _refresh_cost(self):
-        if not self.source_blocks or self.engine.get() != "claude":
-            if hasattr(self, '_cost_main'):
-                self._cost_main.configure(
-                    text="N/A for free engine" if self.engine.get() != "claude"
-                         else "Load a file to see estimate",
-                    fg=COLORS["text_dim"])
-                self._cost_detail.configure(text="")
+    def _refresh_cost(self, exact: bool = False):
+        if not hasattr(self, "_cost_main"):
             return
+        if not self.source_blocks or self.engine.get() != "claude":
+            self._cost_main.configure(text="N/A for free engine" if self.engine.get() != "claude"
+                                      else "Load a file to see estimate", fg=COLORS["text_dim"])
+            self._cost_detail.configure(text="")
+            self._cost_method.configure(text="")
+            return
+        args = dict(blocks=self.source_blocks, model_id=self.claude_model.get(), catalog=self.catalog,
+                    api_key=self._api_key, ctx_blocks=self.context_blocks,
+                    glossary=self._glossary_terms(), batch_size=self.batch_size.get(),
+                    translate_cues=self.translate_cues.get(), target_code=self.target_lang.get(),
+                    src_label=_LANG_LABEL.get(self.source_lang.get(), self.source_lang.get()),
+                    tgt_label=_LANG_LABEL.get(self.target_lang.get(), self.target_lang.get()))
+        if exact:
+            self._cost_method.configure(text="counting…")
 
-        model   = self.claude_model.get()
-        has_ctx = bool(self.context_blocks)
-        est     = estimate_cost(self.source_blocks, model, self._api_key, has_ctx)
+            def work():
+                est = estimate_cost(exact=True, **args)
+                self._post(lambda: self._show_cost(est))
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            self._show_cost(estimate_cost(exact=False, **args))
 
+    def _show_cost(self, est: dict):
         if not est:
             return
-
-        total = est["total_cost"]
-        if total < 0.01:
-            cost_str = f"< $0.01"
+        total = est.get("total_cost")
+        if total is None:
+            self._cost_main.configure(text="price unknown for this model", fg=COLORS["warning"])
         else:
-            cost_str = f"~${total:.3f}"
-
-        self._cost_main.configure(
-            text=cost_str,
-            fg=COLORS["success"] if total < 0.05 else
-               COLORS["warning"] if total < 0.50 else
-               COLORS["error"])
-
-        detail = (
-            f"{est['input_tokens']:,} in + {est['output_tokens']:,} out tokens\n"
-            f"${est['input_mtok']:.2f}/${ est['output_mtok']:.2f} per MTok  "
-            f"({est['model_label']})"
-        )
-        if has_ctx:
+            self._cost_main.configure(
+                text="< $0.01" if total < 0.01 else f"~${total:.3f}",
+                fg=COLORS["success"] if total < 0.05 else COLORS["warning"] if total < 0.50 else COLORS["error"])
+        p = est["price"]
+        price_s = (f"${p['input']:g} in / ${p['output']:g} out per MTok ({p['source']})"
+                   if p["input"] is not None else "no price found")
+        detail = f"{est['input_tokens']:,} in + {est['output_tokens']:,} out tokens\n{price_s}"
+        if self.context_blocks:
             detail += "  [+context]"
         self._cost_detail.configure(text=detail)
+        self._cost_method.configure(
+            text="exact input count" if est.get("method") == "exact" else "approx. — click ↻ exact")
+
+    # ── Glossary area ────────────────────────────────────────────────
+
+    def _build_glossary_area(self, parent, p):
+        self._hint(parent, "One name per line. Loaded automatically from <file>.names.txt "
+                           "next to the subtitle when present.", p)
+        self._gloss_text = tk.Text(parent, height=5, font=FONTS["mono_sm"], bg=COLORS["bg_input"],
+                                   fg=COLORS["text"], insertbackground=COLORS["text"], relief="flat",
+                                   highlightbackground=COLORS["border"], highlightthickness=1, wrap="word")
+        self._gloss_text.pack(fill="x", **p)
+        self._gloss_text.insert("1.0", self._initial_glossary)
+        row = tk.Frame(parent, bg=COLORS["bg_card"])
+        row.pack(fill="x", **p, pady=(4, 0))
+        self._names_btn = self._flat_btn(row, "✦  Auto-detect names (Claude)", self._auto_detect_names,
+                                         font=FONTS["tiny"], pady=3)
+        self._names_btn.pack(side="left")
+        self._flat_btn(row, "Save next to SRT", self._save_glossary_sidecar, dim=True,
+                       font=FONTS["tiny"], pady=3).pack(side="left", padx=(6, 0))
+        self._flat_btn(row, "Clear", lambda: self._gloss_text.delete("1.0", "end"), dim=True,
+                       font=FONTS["tiny"], pady=3).pack(side="right")
+        self._gloss_status = self._hint(parent, "", p)
+
+    def _glossary_text(self) -> str:
+        try:
+            return self._gloss_text.get("1.0", "end").strip()
+        except Exception:
+            return ""
+
+    def _glossary_terms(self) -> list:
+        return parse_glossary(self._glossary_text())
+
+    def _merge_glossary(self, terms: list) -> int:
+        existing = {t.lower() for t in self._glossary_terms()}
+        new = [t for t in terms if t.lower() not in existing]
+        if new:
+            cur = self._glossary_text()
+            self._gloss_text.insert("end", ("\n" if cur else "") + "\n".join(new))
+        return len(new)
+
+    def _save_glossary_sidecar(self):
+        if not self.input_path:
+            messagebox.showwarning("No file", "Load a source SRT first.")
+            return
+        path = glossary_sidecar_path(self.input_path)
+        try:
+            path.write_text("\n".join(self._glossary_terms()) + "\n", encoding="utf-8")
+            self._gloss_status.configure(text=f"Saved: {path.name}")
+            self._log(f"Names saved to {path}", "info")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _auto_detect_names(self):
+        if not self.source_blocks:
+            messagebox.showwarning("No file", "Load a source SRT first.")
+            return
+        if not self._api_key.strip():
+            messagebox.showwarning("API Key", "Auto-detect needs a Claude API key.")
+            return
+        # Use the cheapest current model when available
+        mid = DEFAULT_MODEL if self.catalog.has_model(DEFAULT_MODEL) else self.claude_model.get()
+        model_info = self.catalog.model(mid)
+        self._names_btn.configure(state="disabled")
+        self._gloss_status.configure(text=f"Detecting names with {model_info['display_name']}…")
+
+        def work():
+            try:
+                client = _anthropic().Anthropic(api_key=self._api_key.strip(), max_retries=2, timeout=180)
+                names, usage = extract_names(client, self.source_blocks, model_info,
+                                             _LANG_LABEL.get(self.source_lang.get(), self.source_lang.get()))
+                cost = usage.summary(self.catalog.price(mid))
+
+                def done():
+                    n = self._merge_glossary(names)
+                    self._gloss_status.configure(text=f"{len(names)} names found, {n} added  ·  cost {cost}")
+                    self._log(f"Auto-detect names: {len(names)} found, {n} added  ·  {cost}", "accent")
+                    self._refresh_cost()
+                self._post(done)
+            except Exception as e:
+                msg = _err(e)
+                self._post(lambda: (self._gloss_status.configure(text=f"Failed: {msg}"),
+                                       self._log(f"Auto-detect names failed: {msg}", "error")))
+            finally:
+                self._post(lambda: self._names_btn.configure(state="normal"))
+        threading.Thread(target=work, daemon=True).start()
 
     # ── Dropdown helpers ─────────────────────────────────────────────
 
-    def _make_dropdown(self, parent, p, languages, textvariable, on_change=None):
-        values = [f"{flag}  {label}" for _, label, flag in languages]
-        codes  = [code for code, _, _ in languages]
-
+    def _make_dropdown(self, parent, p, textvariable):
+        values = [f"{flag}  {label}" for _, label, flag in LANGUAGES]
+        codes  = [code for code, _, _ in LANGUAGES]
         style = ttk.Style()
-        style.theme_use('default')
-        style.configure("Lang.TCombobox",
-            fieldbackground=COLORS["bg_input"],
-            background=COLORS["bg_input"],
-            foreground=COLORS["text"],
-            selectbackground=COLORS["accent"],
-            selectforeground=COLORS["text_bright"],
-            arrowcolor=COLORS["accent"],
-            bordercolor=COLORS["border"],
-            lightcolor=COLORS["border"],
-            darkcolor=COLORS["border"],
-        )
-        style.map("Lang.TCombobox",
-            fieldbackground=[("readonly", COLORS["bg_input"])],
-            foreground=[("readonly", COLORS["text"])],
-        )
-
+        style.theme_use("default")
+        style.configure("Lang.TCombobox", fieldbackground=COLORS["bg_input"], background=COLORS["bg_input"],
+                        foreground=COLORS["text"], selectbackground=COLORS["accent"],
+                        selectforeground=COLORS["text_bright"], arrowcolor=COLORS["accent"],
+                        bordercolor=COLORS["border"], lightcolor=COLORS["border"], darkcolor=COLORS["border"])
+        style.map("Lang.TCombobox", fieldbackground=[("readonly", COLORS["bg_input"])],
+                  foreground=[("readonly", COLORS["text"])])
         try:
             cur_idx = codes.index(textvariable.get())
         except ValueError:
             cur_idx = 0
-
         combo_var = tk.StringVar(value=values[cur_idx])
-        combo = ttk.Combobox(parent, textvariable=combo_var,
-                             values=values, state="readonly",
+        combo = ttk.Combobox(parent, textvariable=combo_var, values=values, state="readonly",
                              style="Lang.TCombobox", font=FONTS["body"])
         combo.pack(fill="x", **p, ipady=4)
 
@@ -1038,21 +1850,10 @@ class App(tk.Tk):
             idx = combo.current()
             if idx >= 0:
                 textvariable.set(codes[idx])
-                if on_change:
-                    on_change(codes[idx])
-
         combo.bind("<<ComboboxSelected>>", _on_select)
         return combo, codes, combo_var
 
-    def _build_src_dropdown(self, parent, p):
-        self._src_combo, self._src_codes, self._src_combo_var = \
-            self._make_dropdown(parent, p, SOURCE_LANGUAGES, self.source_lang)
-
-    def _build_tgt_dropdown(self, parent, p):
-        self._tgt_combo, self._tgt_codes, self._tgt_combo_var = \
-            self._make_dropdown(parent, p, TARGET_LANGUAGES, self.target_lang)
-
-    def _set_src_combo(self, code):
+    def _set_src_combo(self, code: str):
         try:
             idx = self._src_codes.index(code)
             self._src_combo.current(idx)
@@ -1060,206 +1861,163 @@ class App(tk.Tk):
         except (ValueError, AttributeError):
             pass
 
-    # ── Claude options ───────────────────────────────────────────────
-
-    def _build_claude_options(self, parent):
-        # API Key
-        tk.Label(parent, text="Claude API Key",
-            font=FONTS["small"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w"
-            ).pack(fill="x")
-
-        key_row = tk.Frame(parent, bg=COLORS["bg_card"])
-        key_row.pack(fill="x", pady=(4, 0))
-
-        self.key_display = tk.Label(key_row,
-            text=self._mask_key(self._api_key),
-            font=FONTS["mono_sm"], bg=COLORS["key_bg"], fg=COLORS["text_dim"],
-            anchor="w", padx=8, pady=5, relief="flat",
-            highlightbackground=COLORS["border"], highlightthickness=1)
-        self.key_display.pack(side="left", fill="x", expand=True)
-
-        tk.Button(key_row, text="✎  Edit", font=FONTS["tiny"],
-            bg=COLORS["bg_input"], fg=COLORS["text_dim"], relief="flat",
-            activebackground=COLORS["border"], activeforeground=COLORS["text_bright"],
-            cursor="hand2", padx=10, pady=5,
-            command=self._edit_key).pack(side="right", padx=(6, 0))
-
-        tk.Label(parent, text="Masked, read-only. Click Edit to update.",
-            font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w"
-            ).pack(fill="x", pady=(3, 0))
-
-        # Cost estimate panel (v0.6.0)
-        self._build_cost_panel(parent)
-
-        # Model
-        tk.Label(parent, text="Claude Model",
-            font=FONTS["small"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w"
-            ).pack(fill="x", pady=(10, 2))
-        for val, lbl in CLAUDE_MODELS:
-            pricing = _FALLBACK_PRICES.get(val, {})
-            price_hint = (f"  [${pricing['input']:.0f}/${ pricing['output']:.0f}/MTok]"
-                          if pricing else "")
-            tk.Radiobutton(parent,
-                text=lbl + price_hint,
-                variable=self.claude_model, value=val,
-                font=FONTS["tiny"], fg=COLORS["text"], bg=COLORS["bg_card"],
-                selectcolor=COLORS["bg_input"], activebackground=COLORS["bg_card"],
-                anchor="w").pack(fill="x", padx=4)
-
-        # Batch size
-        tk.Label(parent, text="Batch size  (blocks per API call)",
-            font=FONTS["small"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w"
-            ).pack(fill="x", pady=(10, 2))
-        for bval, blbl in BATCH_OPTIONS:
-            tk.Radiobutton(parent, text=blbl, variable=self.batch_size, value=bval,
-                font=FONTS["tiny"], fg=COLORS["text"], bg=COLORS["bg_card"],
-                selectcolor=COLORS["bg_input"], activebackground=COLORS["bg_card"],
-                anchor="w").pack(fill="x", padx=4)
-
-        # Workers
-        tk.Label(parent, text="Parallel workers  (concurrent API calls)",
-            font=FONTS["small"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w"
-            ).pack(fill="x", pady=(10, 2))
-        for wval, wlbl in WORKER_OPTIONS:
-            tk.Radiobutton(parent, text=wlbl, variable=self.workers, value=wval,
-                font=FONTS["tiny"], fg=COLORS["text"], bg=COLORS["bg_card"],
-                selectcolor=COLORS["bg_input"], activebackground=COLORS["bg_card"],
-                anchor="w").pack(fill="x", padx=4)
+    # ── Right panel ──────────────────────────────────────────────────
 
     def _build_right(self, parent):
         sty = ttk.Style()
-        sty.theme_use('default')
         sty.configure("T.TNotebook", background=COLORS["bg_dark"], borderwidth=0)
-        sty.configure("T.TNotebook.Tab", background=COLORS["bg_mid"],
-                      foreground=COLORS["text_dim"], padding=[16, 8],
-                      font=FONTS["small"], borderwidth=0)
-        sty.map("T.TNotebook.Tab",
-                background=[("selected", COLORS["bg_card"])],
+        sty.configure("T.TNotebook.Tab", background=COLORS["bg_mid"], foreground=COLORS["text_dim"],
+                      padding=[16, 8], font=FONTS["small"], borderwidth=0)
+        sty.map("T.TNotebook.Tab", background=[("selected", COLORS["bg_card"])],
                 foreground=[("selected", COLORS["text_bright"])])
-
         nb = ttk.Notebook(parent, style="T.TNotebook")
         nb.pack(fill="both", expand=True)
         self.notebook = nb
 
-        # Tab 1: Preview
+        def text_widget(frame, fg=COLORS["text"], bg=COLORS["bg_card"]):
+            w = scrolledtext.ScrolledText(frame, font=FONTS["mono_sm"], bg=bg, fg=fg,
+                                          insertbackground=COLORS["text"], selectbackground=COLORS["accent"],
+                                          relief="flat", state="disabled", wrap="word", highlightthickness=0)
+            return w
+
         t1 = tk.Frame(nb, bg=COLORS["bg_card"])
         nb.add(t1, text="  Source Preview  ")
-        self.preview_text = scrolledtext.ScrolledText(
-            t1, font=FONTS["mono_sm"], bg=COLORS["bg_card"], fg=COLORS["text"],
-            insertbackground=COLORS["text"], selectbackground=COLORS["accent"],
-            relief="flat", state="disabled", wrap="word", highlightthickness=0)
+        self.preview_text = text_widget(t1)
         self.preview_text.pack(fill="both", expand=True, padx=8, pady=8)
-        self.preview_text.tag_configure("id",  foreground=COLORS["accent"],
-                                        font=("Consolas", 10, "bold"))
-        self.preview_text.tag_configure("ts",  foreground=COLORS["text_dim"],
-                                        font=("Consolas", 9))
+        self.preview_text.tag_configure("id", foreground=COLORS["accent"], font=("Consolas", 10, "bold"))
+        self.preview_text.tag_configure("ts", foreground=COLORS["text_dim"], font=("Consolas", 9))
         self.preview_text.tag_configure("txt", foreground=COLORS["text"])
 
-        # Tab 2: Comparison
         t2 = tk.Frame(nb, bg=COLORS["bg_card"])
         nb.add(t2, text="  Comparison  ")
         ch = tk.Frame(t2, bg=COLORS["bg_card"])
         ch.pack(fill="x", padx=8, pady=(8, 4))
-        tk.Label(ch, text="ORIGINAL",   font=FONTS["badge"], fg=COLORS["text_dim"],
-                 bg=COLORS["bg_card"]).pack(side="left",  expand=True)
-        tk.Label(ch, text="TRANSLATED", font=FONTS["badge"], fg=COLORS["success"],
-                 bg=COLORS["bg_card"]).pack(side="right", expand=True)
-        cb = tk.Frame(t2, bg=COLORS["bg_card"])
+        tk.Label(ch, text="ORIGINAL", font=FONTS["badge"], fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side="left", expand=True)
+        self._cmp_title = tk.Label(ch, text="TRANSLATED", font=FONTS["badge"], fg=COLORS["success"], bg=COLORS["bg_card"])
+        self._cmp_title.pack(side="right", expand=True)
+        # Resizable split: drag the sash between the two panes
+        cb = tk.PanedWindow(t2, orient="horizontal", bg=COLORS["border"], sashwidth=6,
+                            sashrelief="flat", bd=0, opaqueresize=True)
         cb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.compare_orig = scrolledtext.ScrolledText(cb, font=FONTS["mono_sm"],
-            bg=COLORS["bg_input"], fg=COLORS["text"], relief="flat",
-            state="disabled", wrap="word", highlightthickness=0, width=40)
-        self.compare_orig.pack(side="left", fill="both", expand=True, padx=(0, 4))
-        self.compare_trans = scrolledtext.ScrolledText(cb, font=FONTS["mono_sm"],
-            bg=COLORS["bg_input"], fg=COLORS["success"], relief="flat",
-            state="disabled", wrap="word", highlightthickness=0, width=40)
-        self.compare_trans.pack(side="right", fill="both", expand=True, padx=(4, 0))
+        self.compare_orig = text_widget(cb, bg=COLORS["bg_input"])
+        self.compare_trans = text_widget(cb, fg=COLORS["success"], bg=COLORS["bg_input"])
+        cb.add(self.compare_orig, stretch="always", minsize=120, width=380)
+        cb.add(self.compare_trans, stretch="always", minsize=120, width=380)
+        for w in (self.compare_orig, self.compare_trans):
+            w.tag_configure("flag", foreground=COLORS["error"])
+            w.tag_configure("hdr", foreground=COLORS["text_dim"])
+            w.tag_configure("flaghdr", foreground=COLORS["warning"], font=("Consolas", 9, "bold"))
 
-        # Tab 3: Log
+        # Keep the two panes scrolled together. The "already there" check stops the
+        # two callbacks from bouncing the view between each other at idle time,
+        # which starved the redraw and left the pane blank until a resize.
+        def _sync(src, dst):
+            def cb(first, last):
+                src.vbar.set(first, last)
+                if abs(dst.yview()[0] - float(first)) > 1e-6:
+                    dst.yview_moveto(first)
+            return cb
+        self.compare_orig.configure(yscrollcommand=_sync(self.compare_orig, self.compare_trans))
+        self.compare_trans.configure(yscrollcommand=_sync(self.compare_trans, self.compare_orig))
+
         t3 = tk.Frame(nb, bg=COLORS["bg_card"])
         nb.add(t3, text="  Activity Log  ")
-        self.log_text = scrolledtext.ScrolledText(
-            t3, font=FONTS["mono_sm"], bg=COLORS["bg_card"], fg=COLORS["text_dim"],
-            insertbackground=COLORS["text"], relief="flat",
-            state="disabled", wrap="word", highlightthickness=0)
+        self.log_text = text_widget(t3, fg=COLORS["text_dim"])
         self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
         for tag, color in [("info", COLORS["text_dim"]), ("success", COLORS["success"]),
-                           ("warn", COLORS["warning"]), ("error", COLORS["error"]),
-                           ("accent", COLORS["accent"])]:
+                           ("warn", COLORS["warning"]), ("error", COLORS["error"]), ("accent", COLORS["accent"])]:
             self.log_text.tag_configure(tag, foreground=color)
 
     def _build_footer(self, parent):
         sty = ttk.Style()
-        sty.configure("P.Horizontal.TProgressbar",
-                      troughcolor=COLORS["bg_dark"], background=COLORS["accent"],
-                      borderwidth=0, thickness=6)
+        sty.configure("P.Horizontal.TProgressbar", troughcolor=COLORS["bg_dark"],
+                      background=COLORS["accent"], borderwidth=0, thickness=6)
         ttk.Progressbar(parent, variable=self.progress_var, maximum=100,
-                        style="P.Horizontal.TProgressbar"
-                        ).pack(fill="x", padx=16, pady=(8, 0))
+                        style="P.Horizontal.TProgressbar").pack(fill="x", padx=16, pady=(8, 0))
         sr = tk.Frame(parent, bg=COLORS["bg_mid"])
         sr.pack(fill="x", padx=16)
-        tk.Label(sr, textvariable=self.status_text, font=FONTS["tiny"],
-                 fg=COLORS["text_dim"], bg=COLORS["bg_mid"], anchor="w").pack(side="left")
-        self.pct_label = tk.Label(sr, text="", font=FONTS["tiny"],
-                                  fg=COLORS["accent"], bg=COLORS["bg_mid"], anchor="e")
+        tk.Label(sr, textvariable=self.status_text, font=FONTS["tiny"], fg=COLORS["text_dim"],
+                 bg=COLORS["bg_mid"], anchor="w").pack(side="left")
+        self.pct_label = tk.Label(sr, text="", font=FONTS["tiny"], fg=COLORS["accent"], bg=COLORS["bg_mid"], anchor="e")
         self.pct_label.pack(side="right")
 
-    # ── Widget Helpers ────────────────────────────────────────────────
+    # ── Widget helpers ───────────────────────────────────────────────
 
-    def _sec(self, parent, num, title):
+    def _sec(self, parent, num, title, help_cmd=None):
         fr = tk.Frame(parent, bg=COLORS["bg_card"])
         fr.pack(fill="x", padx=16, pady=(14, 6))
-        tk.Label(fr, text=num, font=FONTS["badge"],
-                 fg=COLORS["accent"], bg="#1a2744", padx=6, pady=1).pack(side="left")
-        tk.Label(fr, text=f"  {title}", font=FONTS["badge"],
-                 fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w").pack(side="left")
+        tk.Label(fr, text=num, font=FONTS["badge"], fg=COLORS["accent"], bg="#1a2744", padx=6, pady=1).pack(side="left")
+        tk.Label(fr, text=f"  {title}", font=FONTS["badge"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w").pack(side="left")
+        if help_cmd:
+            tk.Button(fr, text="?", font=FONTS["badge"], fg=COLORS["accent"], bg="#1a2744",
+                      activebackground=COLORS["border"], activeforeground=COLORS["text_bright"],
+                      relief="flat", cursor="hand2", padx=7, pady=0, command=help_cmd).pack(side="right")
 
-    def _eng_btn(self, parent, value, name, badge_text, badge_color, desc):
-        sel = self.engine.get() == value
-        fr = tk.Frame(parent,
-            bg=COLORS["drop_active"] if sel else COLORS["bg_input"],
-            highlightbackground=COLORS["accent"] if sel else COLORS["border"],
-            highlightthickness=1, cursor="hand2")
+    def _show_text_dialog(self, title, text, w=620, h=520):
+        dlg = tk.Toplevel(self)
+        dlg.title(title)
+        dlg.configure(bg=COLORS["bg_card"])
+        dlg.transient(self)
+        self.update_idletasks()
+        dlg.geometry(f"{w}x{h}+{self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)}"
+                     f"+{self.winfo_rooty() + max(0, (self.winfo_height() - h) // 2)}")
+        dlg.minsize(420, 320)
+        txt = scrolledtext.ScrolledText(dlg, font=("Consolas", 9), bg=COLORS["bg_dark"], fg=COLORS["text"],
+                                        relief="flat", wrap="word", padx=18, pady=14, highlightthickness=0)
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.tag_configure("hdr", foreground=COLORS["accent"], font=("Consolas", 9, "bold"))
+        for m in re.finditer(r"^([A-Z][A-Z /()0-9.&-]{3,})\n-{3,}", text, re.MULTILINE):
+            line_no = text[:m.start()].count("\n") + 1
+            txt.tag_add("hdr", f"{line_no}.0", f"{line_no}.end")
+        txt.configure(state="disabled")
+        self._flat_btn(dlg, "  Close  ", dlg.destroy, primary=True, padx=20, pady=5).pack(pady=(0, 14))
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    def _show_engine_help(self):
+        self._show_text_dialog("Translation engines", ENGINE_HELP_TEXT, 640, 560)
+
+    def _eng_card(self, value, name, badge_text, badge_color, desc):
+        fr = tk.Frame(self._eng_frame, bg=COLORS["bg_input"], highlightbackground=COLORS["border"],
+                      highlightthickness=1, cursor="hand2")
         fr.pack(fill="x", pady=3)
-
-        def select(e=None):
-            self.engine.set(value)
-            for w in parent.winfo_children():
-                w.destroy()
-            self._eng_btn(parent, "claude", "Claude API", "RECOMMENDED",
-                          COLORS["success"], "Best quality — tone, humor, cultural nuances")
-            self._eng_btn(parent, "free", "MyMemory", "FREE",
-                          COLORS["accent2"], "No API key — literal, less nuanced")
-
-        fr.bind("<Button-1>", select)
-        top = tk.Frame(fr, bg=fr["bg"])
+        top = tk.Frame(fr, bg=COLORS["bg_input"])
         top.pack(fill="x", padx=10, pady=(8, 2))
-        top.bind("<Button-1>", select)
-        rb = tk.Radiobutton(top, variable=self.engine, value=value,
-                            bg=fr["bg"], fg=COLORS["text"],
-                            selectcolor=COLORS["bg_input"], activebackground=fr["bg"])
+        # fg is the dot colour, selectcolor the circle fill when selected: both must
+        # contrast with the dark card background or the indicator is invisible
+        rb = tk.Radiobutton(top, variable=self.engine, value=value, bg=COLORS["bg_input"],
+                            fg=COLORS["text_bright"], activeforeground=COLORS["text_bright"],
+                            selectcolor=COLORS["accent"], activebackground=COLORS["bg_input"],
+                            highlightthickness=0, cursor="hand2")
         rb.pack(side="left")
-        nm = tk.Label(top, text=name, font=FONTS["body"],
-                      fg=COLORS["text_bright"] if sel else COLORS["text"], bg=fr["bg"])
+        nm = tk.Label(top, text=name, font=FONTS["body"], fg=COLORS["text"], bg=COLORS["bg_input"])
         nm.pack(side="left")
-        nm.bind("<Button-1>", select)
-        bd = tk.Label(top, text=f" {badge_text} ", font=FONTS["badge"],
-                      fg="#ffffff", bg=badge_color)
+        bd = tk.Label(top, text=f" {badge_text} ", font=FONTS["badge"], fg="#ffffff", bg=badge_color)
         bd.pack(side="right")
-        bd.bind("<Button-1>", select)
-        dl = tk.Label(fr, text=desc, font=FONTS["tiny"],
-                      fg=COLORS["text_dim"], bg=fr["bg"], anchor="w", wraplength=360)
+        dl = tk.Label(fr, text=desc, font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_input"],
+                      anchor="w", wraplength=380)
         dl.pack(fill="x", padx=30, pady=(0, 8))
-        dl.bind("<Button-1>", select)
+        for w in (fr, top, nm, bd, dl):
+            w.bind("<Button-1>", lambda e, v=value: self.engine.set(v))
+        self._eng_cards[value] = (fr, top, rb, nm, dl)
 
     def _on_engine_change(self, *args):
-        if self.engine.get() == "claude":
+        sel = self.engine.get()
+        for value, (fr, top, rb, nm, dl) in self._eng_cards.items():
+            on = value == sel
+            bg = COLORS["drop_active"] if on else COLORS["bg_input"]
+            fr.configure(bg=bg, highlightbackground=COLORS["accent"] if on else COLORS["border"])
+            for w in (top, rb, nm, dl):
+                w.configure(bg=bg)
+            rb.configure(activebackground=bg)
+            nm.configure(fg=COLORS["text_bright"] if on else COLORS["text"])
+        if sel == "claude":
             self.claude_frame.pack(fill="x", padx=16, pady=(4, 4))
         else:
             self.claude_frame.pack_forget()
         self._refresh_cost()
 
-    # ── API Key ───────────────────────────────────────────────────────
+    # ── API key ──────────────────────────────────────────────────────
 
     def _mask_key(self, key: str) -> str:
         k = key.strip()
@@ -1278,58 +2036,41 @@ class App(tk.Tk):
         dlg.grab_set()
         self.update_idletasks()
         w, h = 460, 210
-        x = self.winfo_rootx() + (self.winfo_width()  - w) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - h) // 2
-        dlg.geometry(f"{w}x{h}+{x}+{y}")
-
-        tk.Label(dlg, text="Update Claude API Key",
-                 font=FONTS["heading"], fg=COLORS["text_bright"],
+        dlg.geometry(f"{w}x{h}+{self.winfo_rootx() + (self.winfo_width() - w) // 2}"
+                     f"+{self.winfo_rooty() + (self.winfo_height() - h) // 2}")
+        tk.Label(dlg, text="Update Claude API Key", font=FONTS["heading"], fg=COLORS["text_bright"],
                  bg=COLORS["bg_card"]).pack(pady=(18, 2))
         tk.Label(dlg, text="Paste your key. Stored locally, sent only to api.anthropic.com.",
-                 font=FONTS["tiny"], fg=COLORS["text_dim"],
-                 bg=COLORS["bg_card"], justify="center").pack()
-
+                 font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack()
         var = tk.StringVar(value=self._api_key)
-        ent = tk.Entry(dlg, textvariable=var, show="•",
-                       font=FONTS["mono_sm"], bg=COLORS["bg_input"], fg=COLORS["text"],
-                       insertbackground=COLORS["text"], relief="flat",
+        ent = tk.Entry(dlg, textvariable=var, show="•", font=FONTS["mono_sm"], bg=COLORS["bg_input"],
+                       fg=COLORS["text"], insertbackground=COLORS["text"], relief="flat",
                        highlightbackground=COLORS["border"], highlightthickness=1, width=48)
         ent.pack(padx=20, pady=(10, 4), ipady=6)
         ent.focus_set()
 
-        show_var = tk.BooleanVar(value=False)
         def toggle():
-            show_var.set(not show_var.get())
-            ent.configure(show="" if show_var.get() else "•")
-            sb2.configure(text="Hide" if show_var.get() else "Show")
-        sb2 = tk.Button(dlg, text="Show", font=FONTS["tiny"],
-                        bg=COLORS["bg_input"], fg=COLORS["text_dim"],
+            ent.configure(show="" if ent.cget("show") else "•")
+            sb2.configure(text="Hide" if not ent.cget("show") else "Show")
+        sb2 = tk.Button(dlg, text="Show", font=FONTS["tiny"], bg=COLORS["bg_input"], fg=COLORS["text_dim"],
                         relief="flat", cursor="hand2", command=toggle)
         sb2.pack()
 
         def save():
             self._api_key = var.get().strip()
             self.key_display.configure(text=self._mask_key(self._api_key))
-            save_config({'api_key': self._api_key})
-            _live_price_cache.clear()   # force re-verify with new key
-            self._refresh_cost()
+            save_config({"api_key": self._api_key})
             dlg.destroy()
-
+            self._refresh_catalog(force=True)
         br = tk.Frame(dlg, bg=COLORS["bg_card"])
         br.pack(pady=(10, 0))
-        tk.Button(br, text="Save", font=FONTS["small"],
-                  bg=COLORS["btn_primary"], fg="#ffffff", relief="flat",
-                  cursor="hand2", padx=18, pady=4, command=save).pack(side="left", padx=6)
-        tk.Button(br, text="Cancel", font=FONTS["small"],
-                  bg=COLORS["bg_input"], fg=COLORS["text_dim"], relief="flat",
-                  cursor="hand2", padx=18, pady=4,
-                  command=dlg.destroy).pack(side="left", padx=6)
-
+        self._flat_btn(br, "Save", save, primary=True, padx=18).pack(side="left", padx=6)
+        self._flat_btn(br, "Cancel", dlg.destroy, dim=True, padx=18).pack(side="left", padx=6)
         ent.bind("<Return>", lambda e: save())
         ent.bind("<Escape>", lambda e: dlg.destroy())
         dlg.wait_window()
 
-    # ── Help ──────────────────────────────────────────────────────────
+    # ── Help ─────────────────────────────────────────────────────────
 
     def _show_help(self):
         dlg = tk.Toplevel(self)
@@ -1337,123 +2078,107 @@ class App(tk.Tk):
         dlg.configure(bg=COLORS["bg_card"])
         dlg.transient(self)
         self.update_idletasks()
-        w, h = 680, 600
-        x = self.winfo_rootx() + max(0, (self.winfo_width()  - w) // 2)
-        y = self.winfo_rooty() + max(0, (self.winfo_height() - h) // 2)
-        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        w, h = 700, 640
+        dlg.geometry(f"{w}x{h}+{self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)}"
+                     f"+{self.winfo_rooty() + max(0, (self.winfo_height() - h) // 2)}")
         dlg.minsize(520, 420)
-        dlg.resizable(True, True)
-
-        txt = scrolledtext.ScrolledText(dlg, font=("Consolas", 9),
-            bg=COLORS["bg_dark"], fg=COLORS["text"], relief="flat",
-            wrap="word", padx=18, pady=14, highlightthickness=0)
+        txt = scrolledtext.ScrolledText(dlg, font=("Consolas", 9), bg=COLORS["bg_dark"], fg=COLORS["text"],
+                                        relief="flat", wrap="word", padx=18, pady=14, highlightthickness=0)
         txt.pack(fill="both", expand=True)
         txt.insert("1.0", HELP_TEXT)
-        txt.tag_configure("hdr", foreground=COLORS["accent"],
-                          font=("Consolas", 9, "bold"))
-        for m in re.finditer(r'^([A-Z][A-Z /()0-9.-]{3,})\n-{3,}', HELP_TEXT, re.MULTILINE):
-            line_no = HELP_TEXT[:m.start()].count('\n') + 1
+        txt.tag_configure("hdr", foreground=COLORS["accent"], font=("Consolas", 9, "bold"))
+        for m in re.finditer(r"^([A-Z][A-Z /()0-9.&-]{3,})\n-{3,}", HELP_TEXT, re.MULTILINE):
+            line_no = HELP_TEXT[:m.start()].count("\n") + 1
             txt.tag_add("hdr", f"{line_no}.0", f"{line_no}.end")
         txt.configure(state="disabled")
+        self._flat_btn(dlg, "  Close  ", dlg.destroy, primary=True, padx=20, pady=5).pack(pady=(0, 14))
 
-        tk.Button(dlg, text="  Close  ", font=FONTS["small"],
-                  bg=COLORS["btn_primary"], fg="#ffffff", relief="flat",
-                  cursor="hand2", padx=20, pady=5,
-                  command=dlg.destroy).pack(pady=(0, 14))
-
-    # ── File Handling ─────────────────────────────────────────────────
+    # ── File handling ────────────────────────────────────────────────
 
     def _browse(self):
-        path = filedialog.askopenfilename(
-            title="Select source SRT file",
-            filetypes=[("SRT files", "*.srt"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(title="Select source SRT file",
+                                          filetypes=[("SRT files", "*.srt"), ("All files", "*.*")])
         if path:
             self._load_source_file(path)
 
     def _browse_context(self):
-        path = filedialog.askopenfilename(
-            title="Select context SRT file (same film, different language)",
-            filetypes=[("SRT files", "*.srt"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(title="Select context SRT file (same film, different language)",
+                                          filetypes=[("SRT files", "*.srt"), ("All files", "*.*")])
         if path:
             self._load_context_file(path)
 
-    def _load_source_file(self, path: str):
+    def _load_srt(self, path: str, what: str):
         path = path.strip()
-        if not path.lower().endswith('.srt'):
-            messagebox.showwarning("Wrong file type",
-                "Please select an .srt subtitle file.")
-            return
+        if not path.lower().endswith(".srt"):
+            messagebox.showwarning("Wrong file type", "Please select an .srt subtitle file.")
+            return None
         try:
             blocks, enc = parse_srt(path)
         except Exception as e:
-            messagebox.showerror("Parse Error", f"Could not parse file:\n{e}")
-            return
+            messagebox.showerror("Parse Error", f"Could not parse {what}:\n{e}")
+            return None
         if not blocks:
-            messagebox.showwarning("Empty File", "No subtitle blocks found.")
+            messagebox.showwarning("Empty File", f"No subtitle blocks found in {what}.")
+            return None
+        return path, blocks, enc.upper().replace("-SIG", "+BOM")
+
+    def _load_source_file(self, path: str):
+        loaded = self._load_srt(path, "file")
+        if not loaded:
             return
-
+        path, blocks, enc_short = loaded
         self.source_blocks = blocks
-        self.input_path    = path
-        name = Path(path).stem
-        self.file_label.configure(
-            text=name + ".srt", fg=COLORS["text_bright"])
-
-        # Encoding + block info
-        enc_short = enc.upper().replace("-SIG", "+BOM")
-        self.file_info.configure(
-            text=f"{len(blocks):,} blocks  •  "
-                 f"IDs {blocks[0]['id']}–{blocks[-1]['id']}  •  {enc_short}")
-
-        avg = sum(len(' '.join(b['text_lines'])) for b in blocks) / len(blocks)
+        self.translated_blocks = []
+        self.qc_issues = []
+        self.input_path = path
+        name = Path(path).name
+        self.file_label.configure(text=name, fg=COLORS["text_bright"])
+        n_cues = sum(1 for b in blocks for l in b["text_lines"] if is_cue(l))
+        n_empty = sum(1 for b in blocks if not b["text_lines"])
+        self.file_info.configure(text=f"{len(blocks):,} blocks  •  IDs {blocks[0]['id']}–{blocks[-1]['id']}"
+                                      f"  •  {enc_short}  •  {n_cues} cue lines"
+                                      + (f"  •  {n_empty} empty" if n_empty else ""))
+        avg = sum(len(" ".join(b["text_lines"])) for b in blocks) / len(blocks)
         sug = suggest_batch_size(blocks)
         self.batch_size.set(sug)
         self.batch_hint.configure(text=f"Auto batch: {sug}  (avg {avg:.0f} chars/block)")
+        detected = detect_language(blocks)
+        self._set_src_combo(detected)
+        self._src_drop.configure(highlightbackground=COLORS["success"], bg=COLORS["bg_input"])
+        self._log(f"Loaded: {name} — {len(blocks):,} blocks  [{enc_short}]  •  {n_cues} cue lines", "accent")
+        self._log(f"Detected: {_LANG_LABEL.get(detected, detected)}  •  avg {avg:.0f} chars/block  •  auto batch={sug}", "info")
 
-        detected_code = detect_language(blocks)
-        self._set_src_combo(detected_code)
-
-        # Reset drop-zone style
-        self._src_drop.configure(
-            highlightbackground=COLORS["success"], bg=COLORS["bg_input"])
-
-        self._log(f"Loaded: {name}.srt — {len(blocks):,} blocks  [{enc_short}]", "accent")
-        self._log(f"Detected: {_LANG_LABEL.get(detected_code, detected_code)}  •  "
-                  f"avg {avg:.0f} chars/block  •  auto batch={sug}", "info")
+        sidecar = glossary_sidecar_path(path)
+        if sidecar.exists():
+            try:
+                n = self._merge_glossary(parse_glossary(sidecar.read_text(encoding="utf-8")))
+                self._gloss_status.configure(text=f"Loaded {sidecar.name} ({n} new names)")
+                self._log(f"Names file: {sidecar.name} — {n} new names added", "info")
+            except Exception as e:
+                self._log(f"Could not read {sidecar.name}: {e}", "warn")
+        self._update_out_name()
         self._show_preview()
         self._refresh_cost()
 
     def _load_context_file(self, path: str):
-        path = path.strip()
-        if not path.lower().endswith('.srt'):
-            messagebox.showwarning("Wrong file type",
-                "Please select an .srt subtitle file.")
+        loaded = self._load_srt(path, "context file")
+        if not loaded:
             return
-        try:
-            blocks, enc = parse_srt(path)
-        except Exception as e:
-            messagebox.showerror("Parse Error", f"Could not parse context file:\n{e}")
-            return
-        if not blocks:
-            messagebox.showwarning("Empty File", "No subtitle blocks found in context file.")
-            return
-
+        path, blocks, enc_short = loaded
+        for b in blocks:
+            b["_ms"] = timestamp_ms(b["timestamp"])
         self.context_blocks = blocks
-        self.context_path   = path
-        name = Path(path).stem
-        enc_short = enc.upper().replace("-SIG", "+BOM")
-        self._ctx_label.configure(
-            text=f"✓  {name}.srt  ({len(blocks):,} blocks  [{enc_short}])",
-            fg=COLORS["success"])
+        self.context_path = path
+        self._ctx_label.configure(text=f"✓  {Path(path).name}  ({len(blocks):,} blocks  [{enc_short}])",
+                                  fg=COLORS["success"])
         self._ctx_clear_btn.pack(side="right")
-        self._log(f"Context: {name}.srt — {len(blocks):,} blocks  [{enc_short}]", "info")
+        self._log(f"Context: {Path(path).name} — {len(blocks):,} blocks  [{enc_short}]", "info")
         self._refresh_cost()
 
     def _clear_context(self):
         self.context_blocks = []
-        self.context_path   = ""
-        self._ctx_label.configure(
-            text="Drop context .srt here  or  Browse…",
-            fg=COLORS["text_dim"])
+        self.context_path = ""
+        self._ctx_label.configure(text="Drop context .srt here  or  Browse…", fg=COLORS["text_dim"])
         self._ctx_clear_btn.pack_forget()
         self._refresh_cost()
 
@@ -1463,234 +2188,300 @@ class App(tk.Tk):
         for b in self.source_blocks[:50]:
             self.preview_text.insert("end", f"{b['id']}\n", "id")
             self.preview_text.insert("end", f"{b['timestamp']}\n", "ts")
-            for line in b['text_lines']:
+            for line in b["text_lines"]:
                 self.preview_text.insert("end", f"{line}\n", "txt")
             self.preview_text.insert("end", "\n")
         if len(self.source_blocks) > 50:
-            self.preview_text.insert("end",
-                f"\n... and {len(self.source_blocks)-50:,} more blocks\n", "ts")
+            self.preview_text.insert("end", f"\n... and {len(self.source_blocks) - 50:,} more blocks\n", "ts")
         self.preview_text.configure(state="disabled")
 
-    # ── Translation ───────────────────────────────────────────────────
+    # ── Translation ──────────────────────────────────────────────────
 
-    def _resolve_output_path(self) -> str | None:
-        """
-        Determine output file path.
-        - If "same folder as source" is ticked: place output next to input.
-        - Otherwise: open Save dialog, remembering last folder used.
-        Returns the resolved path, or None if cancelled.
-        """
-        default_name = Path(self.input_path).stem + f"_{self.target_lang.get()}.srt"
-
-        if self.same_folder.get() and self.input_path:
+    def _resolve_output_path(self):
+        default_name = default_output_name(self.input_path, self.target_lang.get())
+        if self.same_folder.get():
             return str(Path(self.input_path).parent / default_name)
-
-        init_dir = self._last_output_dir or str(Path(self.input_path).parent)
         output = filedialog.asksaveasfilename(
-            title="Save translated file as",
-            defaultextension=".srt",
-            initialfile=default_name,
-            initialdir=init_dir,
+            title="Save translated file as", defaultextension=".srt", initialfile=default_name,
+            initialdir=self._last_output_dir or str(Path(self.input_path).parent),
             filetypes=[("SRT files", "*.srt")])
         if not output:
             return None
-
         self._last_output_dir = str(Path(output).parent)
         self._last_dir_label.configure(text=self._last_dir_display())
         return output
 
-    def _start(self):
+    def _start(self, sample: bool):
+        if self.is_translating:
+            return
         if not self.source_blocks:
             messagebox.showwarning("No File", "Please load an SRT file first.")
             return
-        if self.engine.get() == "claude" and not self._api_key.strip():
-            messagebox.showwarning("API Key",
-                "No Claude API key set.\nClick the Edit button.")
-            return
+        engine = self.engine.get()
+        if engine == "claude":
+            if not self._api_key.strip():
+                messagebox.showwarning("API Key", "No Claude API key set.\nClick the Edit button.")
+                return
+            if _try_import("anthropic") is None:
+                if ensure_dependencies(self):
+                    return
+        elif _try_import("requests") is None:
+            if ensure_dependencies(self):
+                return
 
-        output = self._resolve_output_path()
-        if not output:
-            return
-        self.output_path = output
+        if sample:
+            self.output_path = ""
+            blocks = self.source_blocks[:SAMPLE_BLOCKS]
+        else:
+            output = self._resolve_output_path()
+            if not output:
+                return
+            self.output_path = output
+            blocks = self.source_blocks
 
-        self.is_translating    = True
-        self.cancel_flag       = False
+        self.is_translating = True
+        self.cancel_flag = False
         self.translated_blocks = []
+        self.qc_issues = []
         self.progress_var.set(0)
         self.start_btn.configure(state="disabled")
+        self.sample_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.notebook.select(2)
 
-        total      = len(self.source_blocks)
-        bsize      = self.batch_size.get()
-        n_bat      = (total + bsize - 1) // bsize
-        model_lbl  = self.claude_model.get() if self.engine.get() == "claude" else "MyMemory"
-        src_label  = _LANG_LABEL.get(self.source_lang.get(), self.source_lang.get())
-        tgt_label  = _LANG_LABEL.get(self.target_lang.get(), self.target_lang.get())
-        has_ctx    = bool(self.context_blocks) and self.engine.get() == "claude"
-
+        bsize = self.batch_size.get()
+        model_lbl = self.catalog.model(self.claude_model.get())["display_name"] if engine == "claude" else "MyMemory"
+        glossary = self._glossary_terms()
         self._log("═" * 50, "info")
-        self._log(f"Starting: {src_label} → {tgt_label}", "accent")
+        self._log(f"{'SAMPLE RUN' if sample else 'Starting'}: {_LANG_LABEL.get(self.source_lang.get())} → "
+                  f"{_LANG_LABEL.get(self.target_lang.get())}", "accent")
         self._log(f"Engine  : {model_lbl}", "info")
-        self._log(f"Blocks  : {total:,}  │  Batch: {bsize}  │  Workers: {self.workers.get()}", "info")
-        self._log(f"Context : {'yes (' + Path(self.context_path).name + ')' if has_ctx else 'none'}", "info")
-        self._log(f"Output  : {self.output_path}", "info")
+        self._log(f"Blocks  : {len(blocks):,}  │  Batch: {bsize}  │  Workers: {self.workers.get()}  │  "
+                  f"Cues: {'translate' if self.translate_cues.get() else 'keep'}", "info")
+        self._log(f"Context : {Path(self.context_path).name if self.context_blocks and engine == 'claude' else 'none'}"
+                  f"  │  Names : {len(glossary)}", "info")
+        if not sample:
+            self._log(f"Output  : {self.output_path}", "info")
         self._log("═" * 50, "info")
+        threading.Thread(target=self._worker, args=(blocks, sample, glossary), daemon=True).start()
 
-        threading.Thread(target=self._worker, daemon=True).start()
-
-    def _worker(self):
-        blocks    = self.source_blocks
+    def _worker(self, blocks: list, sample: bool, glossary: list):
         total     = len(blocks)
         engine    = self.engine.get()
-        api_key   = self._api_key
         src       = _LANG_LABEL.get(self.source_lang.get(), self.source_lang.get())
         tgt       = _LANG_LABEL.get(self.target_lang.get(), self.target_lang.get())
-        model     = self.claude_model.get()
-        bsize     = self.batch_size.get()
+        model_id  = self.claude_model.get()
+        model     = self.catalog.model(model_id)
+        price     = self.catalog.price(model_id)
+        bsize     = max(1, self.batch_size.get())
         n_workers = self.workers.get() if engine == "claude" else 1
+        cues      = self.translate_cues.get()
+        ctx       = self.context_blocks if engine == "claude" else []
+        usage     = UsageTotals()
         errors    = []
+        client    = None
+        if engine == "claude":
+            client = _anthropic().Anthropic(api_key=self._api_key.strip(), max_retries=3, timeout=180)
 
-        # Build context script once (stripped of all structural data)
-        ctx_script = ""
-        if engine == "claude" and self.context_blocks:
-            ctx_script = build_context_script(self.context_blocks)
+        batches   = [blocks[i:i + bsize] for i in range(0, total, bsize)]
+        n_batches = len(batches)
+        results   = [None] * n_batches
+        done_cnt  = [0]
+        lock      = threading.Lock()
 
-        batches          = [blocks[i:i+bsize] for i in range(0, total, bsize)]
-        n_batches        = len(batches)
-        results_by_batch = [None] * n_batches
-        completed        = [0]
-        lock             = threading.Lock()
+        def ctx_for(batch, idx):
+            if not ctx:
+                return ""
+            s = min(timestamp_ms(b["timestamp"])[0] for b in batch)
+            e = max(timestamp_ms(b["timestamp"])[1] for b in batch)
+            return context_window_text(ctx, s, e, idx / n_batches, (idx + 1) / n_batches)
+
+        def translate(batch, idx):
+            if engine == "claude":
+                return claude_translate_batch(client, batch, src, tgt, model, glossary,
+                                              ctx_for(batch, idx), cues, usage)
+            return [{**b, "text_lines": translate_free(b["text_lines"], self.source_lang.get(),
+                                                       self.target_lang.get(), cues)} for b in batch]
+
+        def keep_original(batch):
+            return [{**b, "text_lines": b["text_lines"][:], "_untranslated": bool(b["text_lines"])} for b in batch]
 
         def do_batch(idx, batch):
             if self.cancel_flag:
-                return idx, [{**b, "text_lines": b["text_lines"][:]} for b in batch]
+                return idx, keep_original(batch)
             for attempt in range(3):
+                if self.cancel_flag:
+                    return idx, keep_original(batch)
                 try:
-                    if engine == "claude":
-                        out = translate_batch_claude(
-                            batch, src, tgt, api_key, model, ctx_script)
-                    else:
-                        out = [{**b, "text_lines": translate_free(
-                                b["text_lines"],
-                                self.source_lang.get(), self.target_lang.get())}
-                               for b in batch]
-                    return idx, out
+                    return idx, translate(batch, idx)
                 except Exception as e:
-                    if attempt < 2:
+                    fatal = _is_fatal(e)
+                    if attempt < 2 and not fatal:
                         wait = 2 ** (attempt + 1)
-                        self._log(f"Batch {idx+1} attempt {attempt+1} failed: {e}. "
-                                  f"Retry in {wait}s…", "warn")
+                        self._log(f"Batch {idx + 1} attempt {attempt + 1} failed: {_err(e)}. Retry in {wait}s…", "warn")
                         time.sleep(wait)
                     else:
-                        self._log(f"✗ Batch {idx+1} failed: {e} — keeping originals", "error")
-                        errors.append(f"Batch {idx+1}: {e}")
-                        return idx, [{**b, "text_lines": b["text_lines"][:]} for b in batch]
+                        self._log(f"✗ Batch {idx + 1} failed: {_err(e)} — keeping originals", "error")
+                        errors.append(f"Batch {idx + 1}: {_err(e)}")
+                        return idx, keep_original(batch)
+            return idx, keep_original(batch)
 
-        def upd(n_done, bat_num):
+        def progress(n_done):
             pct = n_done / total * 100
-            self.after(0, lambda: self.progress_var.set(pct))
-            self.after(0, lambda: self.status_text.set(
-                f"Batch {bat_num}/{n_batches}  —  {n_done:,}/{total:,} blocks  ({pct:.0f}%)"))
-            self.after(0, lambda: self.pct_label.configure(text=f"{pct:.0f}%"))
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futs = {pool.submit(do_batch, i, b): i for i, b in enumerate(batches)}
+            def ui():
+                self.progress_var.set(pct)
+                self.status_text.set(f"{done_cnt[0]}/{n_batches} batches  —  {n_done:,}/{total:,} blocks  ({pct:.0f}%)")
+                self.pct_label.configure(text=f"{pct:.0f}%")
+            self._post(ui)
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_workers)
+        futs = {pool.submit(do_batch, i, b): i for i, b in enumerate(batches)}
+        blocks_done = 0
+        try:
             for fut in concurrent.futures.as_completed(futs):
                 if self.cancel_flag:
                     break
                 bidx, bres = fut.result()
-                results_by_batch[bidx] = bres
+                results[bidx] = bres
                 with lock:
-                    completed[0] += len(bres)
-                    done = completed[0]
-                upd(done, bidx + 1)
-                self._log(f"  ✓ Batch {bidx+1:3d}/{n_batches}  ({len(bres)} blocks)", "info")
+                    done_cnt[0] += 1
+                    blocks_done += len(bres)
+                progress(blocks_done)
+                self._log(f"  ✓ Batch {bidx + 1:3d}/{n_batches}  ({len(bres)} blocks)", "info")
+        finally:
+            pool.shutdown(wait=not self.cancel_flag, cancel_futures=True)
 
         if self.cancel_flag:
             self._log("Translation cancelled.", "warn")
+            self._post(self._done)
+            return
 
-        self.translated_blocks = [
-            blk
-            for br in results_by_batch if br is not None
-            for blk in br
-        ]
+        out_blocks = [blk for br in results if br is not None for blk in br]
+        if len(out_blocks) != total:
+            self._log(f"✗ Internal error: {len(out_blocks)} of {total} blocks assembled", "error")
+            self._post(self._done)
+            return
 
-        if len(self.translated_blocks) == total and not self.cancel_flag:
+        # ── Quality control + repair pass ─────────────────────────────
+        issues = qc_report(blocks, out_blocks, glossary, cues)
+        retry_idx = sorted({i for i, kind, _ in issues
+                            if kind in ("untranslated", "unchanged", "empty_line", "placeholder", "name", "number")})
+        if retry_idx and engine == "claude" and client is not None:
+            self._log(f"\n─── QUALITY CONTROL ───  {len(retry_idx)} block(s) need a second pass", "accent")
+            self._post(lambda: self.status_text.set(f"QC: retranslating {len(retry_idx)} block(s)…"))
+            for k in range(0, len(retry_idx), 8):
+                chunk = retry_idx[k:k + 8]
+                sub = [{kk: v for kk, v in blocks[i].items()} for i in chunk]
+                try:
+                    fixed = claude_translate_batch(client, sub, src, tgt, model, glossary, "", cues, usage)
+                    for i, fb in zip(chunk, fixed):
+                        out_blocks[i] = fb
+                except Exception as e:
+                    self._log(f"  QC retry failed for blocks {chunk[0] + 1}-{chunk[-1] + 1}: {_err(e)}", "warn")
+            issues = qc_report(blocks, out_blocks, glossary, cues)
+
+        for b in out_blocks:
+            b.pop("_untranslated", None)
+        self.translated_blocks = out_blocks
+        self.qc_issues = issues
+
+        if issues:
+            self._log(f"\nQC report: {len(issues)} issue(s) in {len({i for i, _, _ in issues})} block(s)", "warn")
+            for i, kind, detail in issues[:40]:
+                self._log(f"  [{blocks[i]['id']}] {kind}: {detail}", "warn")
+            if len(issues) > 40:
+                self._log(f"  … and {len(issues) - 40} more (see Comparison tab)", "warn")
+        else:
+            self._log("\nQC report: no issues found", "success")
+
+        # ── Save + verify ─────────────────────────────────────────────
+        if not sample:
             try:
-                write_srt(self.translated_blocks, self.output_path)
+                write_srt(out_blocks, self.output_path)
                 self._log(f"\nFile saved: {self.output_path}", "success")
             except Exception as e:
                 self._log(f"✗ Failed to write: {e}", "error")
-                self.after(0, self._done)
+                self._post(self._done)
                 return
-
-            self._log("\n─── VERIFICATION ───", "accent")
             try:
                 ob, _ = parse_srt(self.output_path)
                 checks = [
-                    ("Block count",     len(ob) == total),
-                    ("First ID",        ob[0]['id'] == blocks[0]['id']),
-                    ("Last ID",         ob[-1]['id'] == blocks[-1]['id']),
-                    ("All IDs match",   all(ob[j]['id'] == blocks[j]['id'] for j in range(total))),
-                    ("All timestamps",  all(ob[j]['timestamp'] == blocks[j]['timestamp'] for j in range(total))),
-                    ("All line counts", all(len(ob[j]['text_lines']) == len(blocks[j]['text_lines']) for j in range(total))),
+                    ("Block count",    len(ob) == total),
+                    ("All IDs match",  all(ob[j]["id"] == blocks[j]["id"] for j in range(min(len(ob), total)))),
+                    ("All timestamps", all(ob[j]["timestamp"] == blocks[j]["timestamp"] for j in range(min(len(ob), total)))),
+                    ("All line counts", all(len(ob[j]["text_lines"]) == len(blocks[j]["text_lines"]) for j in range(min(len(ob), total)))),
                 ]
                 ok_all = all(ok for _, ok in checks)
+                self._log("\n─── VERIFICATION ───", "accent")
                 for nm, ok in checks:
                     self._log(f"  {'✓' if ok else '✗'} {nm}", "success" if ok else "error")
-                self._log(
-                    f"\n{'✅ SUCCESS' if ok_all else '⚠ Completed with issues'}"
-                    f" — {total:,} blocks translated & verified",
-                    "success" if ok_all else "warn")
+                self._log(f"\n{'✅ SUCCESS' if ok_all and not issues else '⚠ Completed with warnings'}"
+                          f" — {total:,} blocks translated & verified", "success" if ok_all and not issues else "warn")
             except Exception as e:
                 self._log(f"Verification error: {e}", "error")
+        else:
+            self._log(f"\nSample finished — {total} blocks (nothing saved)", "success")
 
-            if errors:
-                self._log(f"\n{len(errors)} batch error(s):", "warn")
-                for err in errors[:10]:
-                    self._log(f"  • {err}", "warn")
+        if engine == "claude":
+            self._log(f"Actual cost: {usage.summary(price)}", "accent")
+            if not sample and usage.calls:
+                self._last_run_cost = usage.cost(price)
+        if errors:
+            self._log(f"\n{len(errors)} batch error(s):", "warn")
+            for err in errors[:10]:
+                self._log(f"  • {err}", "warn")
 
-            self.after(0, self._show_comparison)
-
-        self.after(0, self._done)
+        self._post(lambda: self._show_comparison(blocks, out_blocks, issues, sample))
+        self._post(self._done)
 
     def _done(self):
         self.is_translating = False
         self.start_btn.configure(state="normal")
+        self.sample_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
-        if self.translated_blocks and len(self.translated_blocks) == len(self.source_blocks):
-            self.status_text.set(f"Done — {len(self.translated_blocks):,} blocks translated")
-            self.notebook.select(1)
-        elif self.cancel_flag:
+        if self.cancel_flag:
             self.status_text.set("Cancelled")
+        elif self.translated_blocks:
+            n_issues = len(self.qc_issues)
+            self.status_text.set(f"Done — {len(self.translated_blocks):,} blocks"
+                                 + (f"  •  {n_issues} QC warning(s)" if n_issues else "  •  QC clean"))
+            self.notebook.select(1)
         else:
             self.status_text.set("Completed with errors — check Activity Log")
 
     def _cancel(self):
         self.cancel_flag = True
+        self.status_text.set("Cancelling…")
 
-    def _show_comparison(self):
-        self.compare_orig.configure(state="normal")
-        self.compare_trans.configure(state="normal")
-        self.compare_orig.delete("1.0", "end")
-        self.compare_trans.delete("1.0", "end")
-        for i in range(min(60, len(self.source_blocks))):
-            s = self.source_blocks[i]
-            o = self.translated_blocks[i] if i < len(self.translated_blocks) else None
-            self.compare_orig.insert("end", f"[{s['id']}] {s['timestamp']}\n")
-            for ln in s['text_lines']:
-                self.compare_orig.insert("end", f"  {ln}\n")
+    def _show_comparison(self, src_blocks, out_blocks, issues, sample):
+        flagged = {}
+        for i, kind, detail in issues:
+            flagged.setdefault(i, []).append(kind)
+        self._cmp_title.configure(text=f"TRANSLATED{'  (sample)' if sample else ''}"
+                                       + (f"  —  {len(flagged)} flagged" if flagged else ""))
+        for w in (self.compare_orig, self.compare_trans):
+            w.configure(state="normal")
+            w.delete("1.0", "end")
+        for i, (s, o) in enumerate(zip(src_blocks, out_blocks)):
+            tag = "flaghdr" if i in flagged else "hdr"
+            note = f"   ⚠ {', '.join(flagged[i])}" if i in flagged else ""
+            self.compare_orig.insert("end", f"[{s['id']}] {s['timestamp']}\n", tag)
+            self.compare_trans.insert("end", f"[{o['id']}] {o['timestamp']}{note}\n", tag)
+            n = max(len(s["text_lines"]), len(o["text_lines"]))
+            for k in range(n):
+                a = s["text_lines"][k] if k < len(s["text_lines"]) else ""
+                b = o["text_lines"][k] if k < len(o["text_lines"]) else ""
+                self.compare_orig.insert("end", f"  {a}\n")
+                self.compare_trans.insert("end", f"  {b}\n", "flag" if i in flagged else "")
             self.compare_orig.insert("end", "\n")
-            if o:
-                self.compare_trans.insert("end", f"[{o['id']}] {o['timestamp']}\n")
-                for ln in o['text_lines']:
-                    self.compare_trans.insert("end", f"  {ln}\n")
-                self.compare_trans.insert("end", "\n")
-        self.compare_orig.configure(state="disabled")
-        self.compare_trans.configure(state="disabled")
+            self.compare_trans.insert("end", "\n")
+        for w in (self.compare_orig, self.compare_trans):
+            w.configure(state="disabled")
+            w.yview_moveto(0.0)
+        self.update_idletasks()
 
-    # ── Logging ───────────────────────────────────────────────────────
+    # ── Logging ──────────────────────────────────────────────────────
 
     def _log(self, message, tag="info"):
         def _ins():
@@ -1698,13 +2489,42 @@ class App(tk.Tk):
             self.log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n", tag)
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
-        self.after(0, _ins)
+        self._post(_ins)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ERROR HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+
+def _err(e: Exception) -> str:
+    msg = getattr(e, "message", None) or str(e)
+    status = getattr(e, "status_code", None)
+    return f"HTTP {status}: {msg}" if status else msg
+
+
+def _is_fatal(e: Exception) -> bool:
+    """Errors that will not get better by retrying (bad key, bad request, refusal)."""
+    if isinstance(e, BatchRefused):
+        return True
+    status = getattr(e, "status_code", None)
+    return status in (400, 401, 403, 404, 413, 422)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
+def main():
+    root_probe = tk.Tk()
+    root_probe.withdraw()
+    missing = ensure_dependencies(root_probe)
+    root_probe.destroy()
     app = App()
+    if missing:
+        app._log(f"Missing packages: {', '.join(missing)} — install with: "
+                 f"python -m pip install {' '.join(missing)}", "warn")
     app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
