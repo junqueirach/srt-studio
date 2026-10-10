@@ -34,3 +34,6 @@ release/
 *.zip
 *.exe
 pricing.json
+
+# Private notes
+docs/todo.txt

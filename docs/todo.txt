@@ -1,4 +1,0 @@
-improve UI
-save options for translation 
-naming the srt output file without the .en part
-revise the srt file to be translated, sometine it has errors 
