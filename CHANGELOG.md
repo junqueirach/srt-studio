@@ -2,6 +2,27 @@
 
 All notable changes to SRT Translator. Dates are release dates.
 
+## v0.8.0 — 2026-10-09
+
+GUI redesign. Parsing, translation, quality control, pricing and catalog code are unchanged; `tests/test_core.py` passes unchanged.
+
+### Changed
+- One-screen layout: three headings (FILE, LANGUAGES, ENGINE) and a collapsible **Advanced** section (batch size, workers, cue checkbox, save-next-to-source). Nothing scrolls at the default 1000×700 window, even with Advanced open
+- Fixed action bar at the bottom of the column: estimated cost (with ↻ exact), Start, Sample, Cancel and the progress bar are always visible
+- Source and target languages side by side with a ⇄ swap button
+- Engine is a two-way toggle (Claude API ★ | MyMemory (free)); the model drop-down and its ⟳ sit beside it and are greyed out for MyMemory
+- Batch size and workers are spin boxes (5–60 and 1–8) instead of fixed radio choices; the auto-suggested batch size still fills in on load
+- Context file is a compact row under the file box ("Context: none  + add")
+- Settings dialog (⚙ in the header): API key, model/price catalog status with Refresh, pricing.json path, settings file path, last output folder, link to the console
+- Preserve-names list moved to a **Names** tab in the right panel with full height, Auto-detect, Load from file, Save next to SRT, Clear and a count in the tab title
+- Hint paragraphs replaced by hover tooltips; the status line at the bottom says the next step ("Load a .srt file", "Check the estimate, then press Start", "Translating… batch 12/23", "Done — 3 blocks flagged")
+- The 01–07 section badges are gone
+- Window size and position, and the Advanced open/closed state, are remembered
+
+### Fixed
+- Mouse wheel over the settings column no longer changes the drop-down or spin box under the pointer
+- All settings are read on the main thread before a run starts and handed to the worker (Tk variables are no longer read from the worker thread)
+
 ## v0.7.0 — 2026-10-09
 
 Quality-control release. Claude calls now go through the official `anthropic` SDK.

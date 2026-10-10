@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════╗
-║       SRT Subtitle Translator  v0.7.0 — Desktop GUI       ║
+║       SRT Subtitle Translator  v0.8.0 — Desktop GUI       ║
 ║                                                           ║
 ║  Structure-preserving subtitle translation for .srt files ║
 ║  Engines: Claude API · MyMemory (free)                    ║
 ║  Author:  Luiz Junqueira & Claude AI                      ║
 ╚═══════════════════════════════════════════════════════════╝
+
+v0.8.0 changes (GUI redesign, translation engine unchanged):
+  • One-screen layout: FILE, LANGUAGES, ENGINE and a collapsible
+    Advanced section; nothing scrolls at 1000×700
+  • Fixed action bar with the cost estimate right above Start / Sample /
+    Cancel and the progress bar
+  • Languages side by side with a swap button; engine as a two-way
+    toggle with the model drop-down beside it
+  • Settings dialog (⚙) for the API key, catalog refresh and file paths
+  • Names tab in the right panel (full height, auto-detect, load/save)
+  • Tooltips instead of hint paragraphs; status line says the next step
+  • Window size and position remembered; Advanced state remembered
+  • Mouse wheel no longer changes drop-downs while scrolling
 
 v0.7.0 changes:
   • Live model list from the Anthropic API (newest first, cached offline)
@@ -41,6 +54,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
@@ -52,7 +66,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 # VERSION
 # ═══════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v0.7.0"
+APP_VERSION = "v0.8.0"
 APP_TITLE   = f"SRT Subtitle Translator  {APP_VERSION}"
 IS_FROZEN   = bool(getattr(sys, "frozen", False))
 APP_DIR     = Path(sys.executable).parent if IS_FROZEN else Path(__file__).resolve().parent
@@ -1129,6 +1143,23 @@ Loads a .srt subtitle file, translates every dialogue block into
 the chosen language, and saves a new .srt with identical structure:
 block IDs, timestamps and line counts are preserved.
 
+NEW IN v0.8.0
+-------------
+One screen    FILE, LANGUAGES and ENGINE are the three things you
+              set for every run. Batch size, workers, cues and the
+              output-folder rule live under "Advanced". The cost
+              estimate and the Start / Sample / Cancel buttons stay
+              at the bottom of the column.
+
+Settings (⚙)  API key, model and price catalog refresh, file paths.
+
+Names tab     The preserve-names list moved to the right panel with
+              full height, Auto-detect, Load from file, Save next to
+              SRT and Clear. The tab title shows the count.
+
+Tooltips      Hover any control for a short explanation. The status
+              line at the bottom tells you the next step.
+
 NEW IN v0.7.0
 -------------
 Live models    The Claude model list is read from the API (newest
@@ -1152,8 +1183,8 @@ Quality control Each block is checked after the run: unchanged text,
                The QC report appears in the Activity Log and flagged
                blocks are highlighted in the Comparison tab.
 
-Preserve names Type names one per line (people, schools, companies,
-               places). "Auto-detect" asks Claude to list them from
+Preserve names Names tab: one per line (people, schools, companies,
+               brands). "Auto-detect" asks Claude to list them from
                the file for you to review. A <file>.names.txt next to
                the subtitle is loaded automatically and can be saved
                with "Save next to SRT".
@@ -1191,6 +1222,7 @@ rate limits; the app retries automatically.
 RIGHT-PANEL TABS
 ----------------
 Source Preview   First 50 blocks, verify parse before starting.
+Names            Terms that must stay untranslated (see above).
 Comparison       Original vs translated, QC-flagged blocks in colour.
 Activity Log     Batch progress, QC report, real cost.
 """
@@ -1199,8 +1231,8 @@ Activity Log     Batch progress, QC report, real cost.
 ENGINE_HELP_TEXT = """\
 TRANSLATION ENGINES
 -------------------
-The app can translate with two different services. Pick one in
-section 06. Everything else (file loading, structure checks,
+The app can translate with two different services. Pick one with
+the ENGINE toggle. Everything else (file loading, structure checks,
 output naming) works the same way for both.
 
 CLAUDE API  (recommended)
@@ -1225,7 +1257,7 @@ Cost         Pay per token. The estimate panel shows the price
              larger models. Prices come from Anthropic's pricing
              page and are refreshed daily.
 
-Needs        An API key (Edit button) and an internet connection.
+Needs        An API key (⚙ Settings) and an internet connection.
              The key is stored only on this computer.
 
 MYMEMORY  (free)
@@ -1289,18 +1321,82 @@ def _clean_dnd_path(raw: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# SMALL UI HELPERS  (v0.8.0)
+# ═══════════════════════════════════════════════════════════════════════
+
+class Tooltip:
+    """Hover tooltip: appears after a short delay, disappears on leave or click."""
+
+    def __init__(self, widget, text, delay_ms=550):
+        self.widget, self.text, self.delay = widget, text, delay_ms
+        self._after = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self):
+        if self._tip or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except Exception:
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=self.text, font=FONTS["tiny"], fg=COLORS["text_bright"],
+                 bg="#2a3550", padx=8, pady=5, justify="left", wraplength=320,
+                 highlightbackground=COLORS["accent"], highlightthickness=1).pack()
+        tip.wm_geometry(f"+{x}+{y}")
+        self._tip = tip
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
+def _no_wheel(widget):
+    """Stop the mouse wheel from changing a combobox/spinbox while the column scrolls."""
+    widget.bind("<MouseWheel>", lambda e: "break")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # MAIN APP
 # ═══════════════════════════════════════════════════════════════════════
+
+_GEOMETRY_RE = re.compile(r"^(\d{3,4})x(\d{3,4})([+-]\d+)([+-]\d+)$")
+LEFT_WIDTH = 440
+
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1100x840")
-        self.minsize(940, 700)
+        cfg = load_config()
+        geo = cfg.get("window_geometry", "")
+        self.geometry(geo if _GEOMETRY_RE.match(geo or "") else "1000x700")
+        self.minsize(900, 620)
         self.configure(bg=COLORS["bg_dark"])
 
-        cfg = load_config()
         self.catalog = Catalog(cfg)
 
         # State
@@ -1313,7 +1409,7 @@ class App(tk.Tk):
         self.output_path       = ""
         self._last_output_dir  = cfg.get("last_output_dir", "")
         self._api_key          = cfg.get("api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-        self._bg_tasks         = 0
+        self._settings_dlg     = None
 
         # Vars
         self.source_lang    = tk.StringVar(value=cfg.get("source_lang", "en-US"))
@@ -1322,10 +1418,13 @@ class App(tk.Tk):
         self.claude_model   = tk.StringVar(value=self.catalog.pick_default(cfg.get("claude_model", "")))
         self.same_folder    = tk.BooleanVar(value=cfg.get("same_folder", False))
         self.translate_cues = tk.BooleanVar(value=cfg.get("translate_cues", True))
+        self.advanced_open  = tk.BooleanVar(value=cfg.get("advanced_open", False))
         self.batch_size     = tk.IntVar(value=int(cfg.get("batch_size", 25)))
         self.workers        = tk.IntVar(value=int(cfg.get("workers", 5)))
         self.progress_var   = tk.DoubleVar(value=0)
-        self.status_text    = tk.StringVar(value="Ready")
+        self.status_text    = tk.StringVar(value="Load a .srt file to begin")
+        self._catalog_status = tk.StringVar(value="")
+        self._names_count   = tk.StringVar(value="0 names")
         self.is_translating = False
         self.cancel_flag    = False
         self._initial_glossary = cfg.get("glossary", "")
@@ -1336,9 +1435,15 @@ class App(tk.Tk):
         self.after(40, self._drain_ui_queue)
 
         self.claude_model.trace_add("write", lambda *_: self._refresh_cost())
-        self.target_lang.trace_add("write", lambda *_: self._refresh_cost())
-        self.translate_cues.trace_add("write", lambda *_: self._refresh_cost())
-        self.batch_size.trace_add("write", lambda *_: self._refresh_cost())
+        self.target_lang.trace_add("write", lambda *_: (self._update_file_info(), self._refresh_cost()))
+        self.translate_cues.trace_add("write", lambda *_: (self._update_adv_summary(), self._refresh_cost()))
+        self.batch_size.trace_add("write", lambda *_: (self._update_adv_summary(), self._refresh_cost()))
+        self.workers.trace_add("write", lambda *_: self._update_adv_summary())
+        self.same_folder.trace_add("write", lambda *_: self._update_adv_summary())
+        self.engine.trace_add("write", self._on_engine_change)
+        self._on_engine_change()
+        self._update_adv_summary()
+        self._update_names_count()
 
         self.after(300, self._startup_refresh)
 
@@ -1365,6 +1470,14 @@ class App(tk.Tk):
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
+    def _int(self, var, default, lo, hi) -> int:
+        """Safe read of an IntVar bound to a spinbox (empty/invalid text → default)."""
+        try:
+            v = int(var.get())
+        except (tk.TclError, ValueError):
+            return default
+        return max(lo, min(hi, v))
+
     def _on_close(self):
         save_config({
             "api_key":         self._api_key,
@@ -1372,17 +1485,18 @@ class App(tk.Tk):
             "source_lang":     self.source_lang.get(),
             "target_lang":     self.target_lang.get(),
             "engine":          self.engine.get(),
-            "batch_size":      self.batch_size.get(),
-            "workers":         self.workers.get(),
+            "batch_size":      self._int(self.batch_size, 25, 5, 60),
+            "workers":         self._int(self.workers, 5, 1, 8),
             "same_folder":     self.same_folder.get(),
             "translate_cues":  self.translate_cues.get(),
+            "advanced_open":   self.advanced_open.get(),
             "last_output_dir": self._last_output_dir,
             "glossary":        self._glossary_text(),
+            "window_geometry": self.winfo_geometry(),
         })
         self.destroy()
 
     def _startup_refresh(self):
-        """Refresh models (needs key) and prices in the background when stale."""
         self._log(f"Models: {len(self.catalog.models)} ({self.catalog.models_source})  •  "
                   f"Prices: {self.catalog.prices_source}"
                   + ("  •  pricing.json override active" if self.catalog.override else ""), "info")
@@ -1391,20 +1505,24 @@ class App(tk.Tk):
         if self.catalog.prices_stale() or (self.catalog.models_stale() and self._api_key.strip()):
             self._refresh_catalog(force=False)
 
-    # ── UI Build ─────────────────────────────────────────────────────
+    # ── UI build ─────────────────────────────────────────────────────
 
     def _build_ui(self):
-        hdr = tk.Frame(self, bg=COLORS["bg_mid"], height=52)
+        self._style()
+        hdr = tk.Frame(self, bg=COLORS["bg_mid"], height=50)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
         tk.Label(hdr, text=f"◈  {APP_TITLE}", font=FONTS["title"], fg=COLORS["accent"],
-                 bg=COLORS["bg_mid"], padx=20).pack(side="left", pady=10)
-        self._flat_btn(hdr, "?  Help", self._show_help, dim=True).pack(side="right", padx=16, pady=10)
+                 bg=COLORS["bg_mid"], padx=18).pack(side="left", pady=9)
+        self._flat_btn(hdr, "?  Help", self._show_help, dim=True).pack(side="right", padx=(6, 16), pady=9)
+        b = self._flat_btn(hdr, "⚙  Settings", self._show_settings, dim=True)
+        b.pack(side="right", pady=9)
+        Tooltip(b, "API key, model and price catalog, file locations")
 
         body = tk.Frame(self, bg=COLORS["bg_dark"])
-        body.pack(fill="both", expand=True, padx=16, pady=12)
+        body.pack(fill="both", expand=True, padx=14, pady=(10, 6))
 
-        left = tk.Frame(body, bg=COLORS["bg_card"], width=470,
+        left = tk.Frame(body, bg=COLORS["bg_card"], width=LEFT_WIDTH,
                         highlightbackground=COLORS["border"], highlightthickness=1)
         left.pack(side="left", fill="y", padx=(0, 10))
         left.pack_propagate(False)
@@ -1414,10 +1532,30 @@ class App(tk.Tk):
         right.pack(side="left", fill="both", expand=True)
         self._build_right(right)
 
-        ftr = tk.Frame(self, bg=COLORS["bg_mid"], height=42)
+        ftr = tk.Frame(self, bg=COLORS["bg_mid"], height=30)
         ftr.pack(fill="x", side="bottom")
         ftr.pack_propagate(False)
-        self._build_footer(ftr)
+        tk.Label(ftr, textvariable=self.status_text, font=FONTS["tiny"], fg=COLORS["text_dim"],
+                 bg=COLORS["bg_mid"], anchor="w", padx=16).pack(side="left", fill="x", expand=True)
+
+    def _style(self):
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("Lang.TCombobox", fieldbackground=COLORS["bg_input"], background=COLORS["bg_input"],
+                        foreground=COLORS["text"], selectbackground=COLORS["accent"],
+                        selectforeground=COLORS["text_bright"], arrowcolor=COLORS["accent"],
+                        bordercolor=COLORS["border"], lightcolor=COLORS["border"], darkcolor=COLORS["border"])
+        style.map("Lang.TCombobox", fieldbackground=[("readonly", COLORS["bg_input"]), ("disabled", COLORS["bg_mid"])],
+                  foreground=[("readonly", COLORS["text"]), ("disabled", COLORS["text_dim"])])
+        style.configure("T.TNotebook", background=COLORS["bg_dark"], borderwidth=0)
+        style.configure("T.TNotebook.Tab", background=COLORS["bg_mid"], foreground=COLORS["text_dim"],
+                        padding=[14, 7], font=FONTS["small"], borderwidth=0)
+        style.map("T.TNotebook.Tab", background=[("selected", COLORS["bg_card"])],
+                  foreground=[("selected", COLORS["text_bright"])])
+        style.configure("P.Horizontal.TProgressbar", troughcolor=COLORS["bg_dark"],
+                        background=COLORS["accent"], borderwidth=0, thickness=6)
+        style.configure("L.Vertical.TScrollbar", background=COLORS["bg_mid"], troughcolor=COLORS["bg_card"],
+                        arrowcolor=COLORS["text_dim"], bordercolor=COLORS["bg_card"])
 
     def _flat_btn(self, parent, text, cmd, primary=False, danger=False, dim=False, font=None, **kw):
         bg = COLORS["btn_primary"] if primary else COLORS["btn_danger"] if danger else COLORS["bg_input"]
@@ -1427,206 +1565,485 @@ class App(tk.Tk):
                          activeforeground=COLORS["text_bright"], cursor="hand2",
                          padx=kw.pop("padx", 12), pady=kw.pop("pady", 4), command=cmd, **kw)
 
+    def _heading(self, parent, text, right_widget_factory=None):
+        fr = tk.Frame(parent, bg=COLORS["bg_card"])
+        fr.pack(fill="x", padx=14, pady=(6, 2))
+        tk.Label(fr, text=text, font=FONTS["badge"], fg=COLORS["accent"], bg=COLORS["bg_card"],
+                 anchor="w").pack(side="left")
+        if right_widget_factory:
+            right_widget_factory(fr).pack(side="right")
+        return fr
+
+    # ── Left column ──────────────────────────────────────────────────
+
     def _build_left(self, parent):
+        # Action bar first (bottom, always visible), then a scrollable area for the form
+        self._build_action_bar(parent)
+
         canvas = tk.Canvas(parent, bg=COLORS["bg_card"], highlightthickness=0)
-        sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        sf = tk.Frame(canvas, bg=COLORS["bg_card"])
-        sf.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=sf, anchor="nw", width=460)
+        sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview, style="L.Vertical.TScrollbar")
+        form = tk.Frame(canvas, bg=COLORS["bg_card"])
+        win = canvas.create_window((0, 0), window=form, anchor="nw", width=LEFT_WIDTH - 2)
+
+        def _resize(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            need = form.winfo_reqheight() > canvas.winfo_height()
+            if need and not sb.winfo_ismapped():
+                sb.pack(side="right", fill="y")
+                canvas.itemconfigure(win, width=LEFT_WIDTH - 2 - sb.winfo_reqwidth())
+            elif not need and sb.winfo_ismapped():
+                sb.pack_forget()
+                canvas.itemconfigure(win, width=LEFT_WIDTH - 2)
+                canvas.yview_moveto(0)
+        form.bind("<Configure>", _resize)
+        canvas.bind("<Configure>", _resize)
         canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        # Mouse wheel only while the pointer is over the left panel
         def _wheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            if sb.winfo_ismapped():
+                canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _wheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        self._form = form
 
-        p = {"padx": 16}
-        f = sf
+        self._build_file_section(form)
+        self._build_language_section(form)
+        self._build_engine_section(form)
+        self._build_advanced_section(form)
 
-        self._sec(f, "01", "SOURCE FILE")
-        self._build_source_file_area(f, p)
-
-        self._sec(f, "02", "CONTEXT FILE  (optional, Claude API only)")
-        self._build_context_file_area(f, p)
-
-        self._sec(f, "03", "OUTPUT DESTINATION")
-        self._build_output_options(f, p)
-
-        self._sec(f, "04", "SOURCE LANGUAGE")
-        self._src_combo, self._src_codes, self._src_combo_var = \
-            self._make_dropdown(f, p, self.source_lang)
-        self._hint(f, "Auto-detected from file. Adjust if incorrect.", p)
-
-        self._sec(f, "05", "TARGET LANGUAGE")
-        # keep the references: a discarded StringVar is garbage-collected and the box goes blank
-        self._tgt_combo, self._tgt_codes, self._tgt_combo_var = \
-            self._make_dropdown(f, p, self.target_lang)
-        self._hint(f, "Last selection remembered between sessions.", p)
-
-        self._sec(f, "06", "TRANSLATION ENGINE", help_cmd=self._show_engine_help)
-        self._eng_frame = tk.Frame(f, bg=COLORS["bg_card"])
-        self._eng_frame.pack(fill="x", **p, pady=(0, 4))
-        self._eng_cards = {}
-        self._eng_card("claude", "Claude API", "RECOMMENDED", COLORS["success"],
-                       "Best quality — tone, humour, names, cues, quality control")
-        self._eng_card("free", "MyMemory", "FREE", COLORS["accent2"],
-                       "No API key — literal, less nuanced")
-        self.engine.trace_add("write", self._on_engine_change)
-
-        self.claude_frame = tk.Frame(f, bg=COLORS["bg_card"])
-        self.claude_frame.pack(fill="x", **p, pady=(4, 4))
-        self._build_claude_options(self.claude_frame)
-
-        tk.Checkbutton(f, text="Translate hearing-impaired cues  [door slams]  (laughs)  APPLAUSE",
-                       variable=self.translate_cues, font=FONTS["tiny"], fg=COLORS["text"],
-                       bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
-                       activebackground=COLORS["bg_card"], anchor="w", cursor="hand2"
-                       ).pack(fill="x", **p, pady=(2, 0))
-
-        self._sec(f, "07", "PRESERVE NAMES  (never translated)")
-        self._build_glossary_area(f, p)
-
-        self._on_engine_change()
-
-        # Action buttons
-        bf = tk.Frame(f, bg=COLORS["bg_card"])
-        bf.pack(fill="x", **p, pady=(12, 16))
-        self.start_btn = tk.Button(bf, text="▶  Start Translation", font=FONTS["heading"],
-                                   bg=COLORS["btn_primary"], fg="#ffffff", relief="flat",
-                                   activebackground=COLORS["btn_hover"], activeforeground="#ffffff",
-                                   cursor="hand2", pady=10, command=lambda: self._start(sample=False))
-        self.start_btn.pack(fill="x", pady=(0, 6))
-        row = tk.Frame(bf, bg=COLORS["bg_card"])
-        row.pack(fill="x")
-        self.sample_btn = self._flat_btn(row, f"◐  Sample ({SAMPLE_BLOCKS} blocks)",
-                                         lambda: self._start(sample=True), pady=6)
-        self.sample_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
-        self.cancel_btn = self._flat_btn(row, "✕  Cancel", self._cancel, danger=True, pady=6)
-        self.cancel_btn.configure(state="disabled")
-        self.cancel_btn.pack(side="left", fill="x", expand=True, padx=(3, 0))
-
-    def _hint(self, parent, text, p, color=None):
-        lbl = tk.Label(parent, text=text, font=FONTS["tiny"], fg=color or COLORS["text_dim"],
-                       bg=COLORS["bg_card"], anchor="w", justify="left", wraplength=420)
-        lbl.pack(fill="x", **p, pady=(2, 8))
-        return lbl
-
-    # ── Source / context / output areas ──────────────────────────────
-
-    def _drop_zone(self, parent, p, text, browse_cmd, load_cmd, small=False):
-        zone = tk.Frame(parent, bg=COLORS["bg_input"], highlightbackground=COLORS["border"],
-                        highlightthickness=1, cursor="hand2")
-        zone.pack(fill="x", **p, pady=(0, 4))
-        inner = tk.Frame(zone, bg=COLORS["bg_input"])
-        inner.pack(fill="x", padx=10, pady=6 if small else 8)
-        label = tk.Label(inner, text=text, font=FONTS["tiny"] if small else FONTS["small"],
-                         fg=COLORS["text_dim"], bg=COLORS["bg_input"], anchor="w", cursor="hand2")
-        label.pack(side="left", fill="x", expand=True)
-        zone.bind("<Button-1>", lambda e: browse_cmd())
-        label.bind("<Button-1>", lambda e: browse_cmd())
-        _try_enable_dnd(zone, load_cmd,
-                        on_enter=lambda: zone.configure(highlightbackground=COLORS["accent"], bg=COLORS["drop_active"]),
-                        on_leave=lambda: zone.configure(highlightbackground=COLORS["border"], bg=COLORS["bg_input"]))
-        return zone, inner, label
-
-    def _build_source_file_area(self, parent, p):
-        self._src_drop, inner, self.file_label = self._drop_zone(
-            parent, p, "Drop .srt here  or  Browse…", self._browse, self._load_source_file)
+    # FILE ────────────────────────────────────────────────────────────
+    def _build_file_section(self, f):
+        self._heading(f, "FILE")
+        self._src_drop = tk.Frame(f, bg=COLORS["bg_input"], highlightbackground=COLORS["border"],
+                                  highlightthickness=1, cursor="hand2")
+        self._src_drop.pack(fill="x", padx=14)
+        inner = tk.Frame(self._src_drop, bg=COLORS["bg_input"])
+        inner.pack(fill="x", padx=10, pady=5)
+        self.file_label = tk.Label(inner, text="Drop a .srt here  or  Browse…", font=FONTS["small"],
+                                   fg=COLORS["text_dim"], bg=COLORS["bg_input"], anchor="w", cursor="hand2")
+        self.file_label.pack(side="left", fill="x", expand=True)
         self._flat_btn(inner, "Browse…", self._browse, pady=3).pack(side="right")
-        self.file_info = tk.Label(parent, text="", font=FONTS["tiny"], fg=COLORS["text_dim"],
-                                  bg=COLORS["bg_card"], anchor="w")
-        self.file_info.pack(fill="x", **p, pady=(0, 1))
-        self.batch_hint = tk.Label(parent, text="", font=FONTS["tiny"], fg=COLORS["accent"],
+        for w in (self._src_drop, self.file_label):
+            w.bind("<Button-1>", lambda e: self._browse())
+        _try_enable_dnd(self._src_drop, self._load_source_file,
+                        on_enter=lambda: self._src_drop.configure(highlightbackground=COLORS["accent"], bg=COLORS["drop_active"]),
+                        on_leave=lambda: self._src_drop.configure(highlightbackground=COLORS["border"], bg=COLORS["bg_input"]))
+        Tooltip(self._src_drop, "The subtitle to translate. Drag a .srt file here or click to browse.\n"
+                                "Block IDs, timestamps and line counts are never changed.")
+
+        self.file_info = tk.Label(f, text="", font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"],
+                                  anchor="w", justify="left", wraplength=LEFT_WIDTH - 30)
+        self.file_info.pack(fill="x", padx=14, pady=(2, 0))
+
+        # Context row
+        row = tk.Frame(f, bg=COLORS["bg_card"])
+        row.pack(fill="x", padx=14, pady=(3, 0))
+        self._ctx_row = row
+        self._ctx_label = tk.Label(row, text="Context: none", font=FONTS["tiny"], fg=COLORS["text_dim"],
                                    bg=COLORS["bg_card"], anchor="w")
-        self.batch_hint.pack(fill="x", **p, pady=(0, 8))
+        self._ctx_label.pack(side="left", fill="x", expand=True)
+        self._ctx_clear_btn = self._flat_btn(row, "✕", self._clear_context, dim=True, font=FONTS["tiny"], padx=6, pady=1)
+        self._ctx_add_btn = self._flat_btn(row, "+ add", self._browse_context, dim=True, font=FONTS["tiny"], padx=8, pady=1)
+        self._ctx_add_btn.pack(side="right")
+        _try_enable_dnd(row, self._load_context_file)
+        Tooltip(row, "Optional, Claude only: the same film in another language. Only the lines\n"
+                     "around each batch (by timestamp) are sent, so the extra cost is small.")
 
-    def _build_context_file_area(self, parent, p):
-        self._ctx_drop, inner, self._ctx_label = self._drop_zone(
-            parent, p, "Drop context .srt here  or  Browse…", self._browse_context,
-            self._load_context_file, small=True)
-        self._ctx_clear_btn = tk.Button(inner, text="✕", font=FONTS["tiny"], bg=COLORS["bg_input"],
-                                        fg=COLORS["error"], relief="flat", cursor="hand2", padx=6,
-                                        command=self._clear_context)
-        self._flat_btn(inner, "Browse…", self._browse_context, font=FONTS["tiny"], padx=10, pady=2
-                       ).pack(side="right", padx=(0, 4))
-        self._hint(parent, "Same film in another language. Only the lines around each batch "
-                           "(by timestamp) are sent, so the extra cost is small.", p)
+    # LANGUAGES ───────────────────────────────────────────────────────
+    def _build_language_section(self, f):
+        self._heading(f, "LANGUAGES")
+        row = tk.Frame(f, bg=COLORS["bg_card"])
+        row.pack(fill="x", padx=14)
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(2, weight=1)
+        self._src_combo, self._src_codes, self._src_combo_var = self._make_dropdown(row, self.source_lang)
+        self._src_combo.grid(row=0, column=0, sticky="ew", ipady=3)
+        swap = self._flat_btn(row, "⇄", self._swap_languages, dim=True, font=FONTS["body"], padx=8, pady=2)
+        swap.grid(row=0, column=1, padx=6)
+        Tooltip(swap, "Swap source and target language")
+        self._tgt_combo, self._tgt_codes, self._tgt_combo_var = self._make_dropdown(row, self.target_lang)
+        self._tgt_combo.grid(row=0, column=2, sticky="ew", ipady=3)
+        Tooltip(self._src_combo, "Source language, detected from the file. Adjust if wrong.")
+        Tooltip(self._tgt_combo, "Target language. Remembered between sessions.")
 
-    def _build_output_options(self, parent, p):
-        of = tk.Frame(parent, bg=COLORS["bg_card"])
-        of.pack(fill="x", **p, pady=(0, 8))
-        tk.Checkbutton(of, text="Save in same folder as source file (skip Save dialog)",
-                       variable=self.same_folder, font=FONTS["tiny"], fg=COLORS["text"],
-                       bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
-                       activebackground=COLORS["bg_card"], anchor="w", cursor="hand2").pack(fill="x")
-        self._last_dir_label = tk.Label(of, text=self._last_dir_display(), font=FONTS["tiny"],
-                                        fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w")
-        self._last_dir_label.pack(fill="x", pady=(2, 0))
-        self._out_name_label = tk.Label(of, text="", font=FONTS["tiny"], fg=COLORS["text_dim"],
-                                        bg=COLORS["bg_card"], anchor="w")
-        self._out_name_label.pack(fill="x", pady=(2, 0))
-        self.target_lang.trace_add("write", lambda *_: self._update_out_name())
+    def _make_dropdown(self, parent, textvariable):
+        values = [f"{flag}  {label}" for _, label, flag in LANGUAGES]
+        codes  = [code for code, _, _ in LANGUAGES]
+        try:
+            cur_idx = codes.index(textvariable.get())
+        except ValueError:
+            cur_idx = 0
+        combo_var = tk.StringVar(value=values[cur_idx])
+        combo = ttk.Combobox(parent, textvariable=combo_var, values=values, state="readonly",
+                             style="Lang.TCombobox", font=FONTS["small"])
+        _no_wheel(combo)
 
-    def _last_dir_display(self) -> str:
-        d = self._last_output_dir
-        if not d:
-            return "Last output folder: (none yet)"
-        return "Last output folder: " + (d if len(d) <= 48 else "…" + d[-45:])
+        def _on_select(event=None):
+            idx = combo.current()
+            if idx >= 0:
+                textvariable.set(codes[idx])
+        combo.bind("<<ComboboxSelected>>", _on_select)
+        return combo, codes, combo_var
 
-    def _update_out_name(self):
-        if self.input_path:
-            self._out_name_label.configure(
-                text="Output name: " + default_output_name(self.input_path, self.target_lang.get()))
+    def _set_combo(self, combo, codes, var, code):
+        try:
+            combo.current(codes.index(code))
+            var.set(code)
+        except (ValueError, AttributeError):
+            pass
 
-    # ── Claude options ───────────────────────────────────────────────
+    def _set_src_combo(self, code):
+        self._set_combo(self._src_combo, self._src_codes, self.source_lang, code)
 
-    def _build_claude_options(self, parent):
-        tk.Label(parent, text="Claude API Key", font=FONTS["small"], fg=COLORS["text_dim"],
-                 bg=COLORS["bg_card"], anchor="w").pack(fill="x")
-        key_row = tk.Frame(parent, bg=COLORS["bg_card"])
-        key_row.pack(fill="x", pady=(4, 0))
-        self.key_display = tk.Label(key_row, text=self._mask_key(self._api_key), font=FONTS["mono_sm"],
-                                    bg=COLORS["key_bg"], fg=COLORS["text_dim"], anchor="w", padx=8, pady=5,
-                                    highlightbackground=COLORS["border"], highlightthickness=1)
-        self.key_display.pack(side="left", fill="x", expand=True)
-        self._flat_btn(key_row, "✎  Edit", self._edit_key, dim=True, font=FONTS["tiny"], padx=10, pady=5
-                       ).pack(side="right", padx=(6, 0))
+    def _swap_languages(self):
+        s, t = self.source_lang.get(), self.target_lang.get()
+        self._set_combo(self._src_combo, self._src_codes, self.source_lang, t)
+        self._set_combo(self._tgt_combo, self._tgt_codes, self.target_lang, s)
 
-        # Model
-        mrow = tk.Frame(parent, bg=COLORS["bg_card"])
-        mrow.pack(fill="x", pady=(10, 2))
-        tk.Label(mrow, text="Claude Model", font=FONTS["small"], fg=COLORS["text_dim"],
-                 bg=COLORS["bg_card"], anchor="w").pack(side="left")
-        self._models_status = tk.Label(mrow, text="", font=FONTS["tiny"], fg=COLORS["text_dim"],
-                                       bg=COLORS["bg_card"], anchor="e")
-        self._models_status.pack(side="right")
-        mr2 = tk.Frame(parent, bg=COLORS["bg_card"])
-        mr2.pack(fill="x")
+    # ENGINE ──────────────────────────────────────────────────────────
+    def _build_engine_section(self, f):
+        self._heading(f, "ENGINE", lambda fr: tk.Button(
+            fr, text="?", font=FONTS["badge"], fg=COLORS["accent"], bg="#1a2744",
+            activebackground=COLORS["border"], activeforeground=COLORS["text_bright"],
+            relief="flat", cursor="hand2", padx=7, pady=0, command=self._show_engine_help))
+        row = tk.Frame(f, bg=COLORS["bg_card"])
+        row.pack(fill="x", padx=14)
+        seg = tk.Frame(row, bg=COLORS["border"], highlightthickness=0)
+        seg.pack(side="left")
+        self._eng_btns = {}
+        for value, text in (("claude", "Claude API ★"), ("free", "MyMemory (free)")):
+            b = tk.Button(seg, text=text, font=FONTS["small"], relief="flat", cursor="hand2",
+                          padx=10, pady=4, bd=0, command=lambda v=value: self.engine.set(v))
+            b.pack(side="left", padx=1, pady=1)
+            self._eng_btns[value] = b
+        Tooltip(seg, "Claude API: best quality, needs your API key (Settings).\n"
+                     "MyMemory: free, literal, no key, limited daily volume.")
+
+        mrow = tk.Frame(f, bg=COLORS["bg_card"])
+        mrow.pack(fill="x", padx=14, pady=(4, 0))
         self._model_combo_var = tk.StringVar()
-        self._model_combo = ttk.Combobox(mr2, textvariable=self._model_combo_var, state="readonly",
+        self._model_combo = ttk.Combobox(mrow, textvariable=self._model_combo_var, state="readonly",
                                          style="Lang.TCombobox", font=FONTS["tiny"])
         self._model_combo.pack(side="left", fill="x", expand=True, ipady=3)
         self._model_combo.bind("<<ComboboxSelected>>", self._on_model_selected)
-        self._flat_btn(mr2, "↻", lambda: self._refresh_catalog(force=True), dim=True,
-                       font=FONTS["small"], padx=8, pady=2).pack(side="right", padx=(6, 0))
+        _no_wheel(self._model_combo)
+        self._model_refresh_btn = self._flat_btn(mrow, "⟳", lambda: self._refresh_catalog(force=True), dim=True,
+                                                 font=FONTS["small"], padx=8, pady=2)
+        self._model_refresh_btn.pack(side="right", padx=(6, 0))
+        Tooltip(self._model_combo, "Claude model. ★ marks the cheapest current model.\nPrice per million tokens, in / out.")
+        Tooltip(self._model_refresh_btn, "Re-read the model list from the API and the prices from anthropic.com")
         self._fill_model_combo()
 
-        self._build_cost_panel(parent)
+    # ADVANCED ────────────────────────────────────────────────────────
+    def _build_advanced_section(self, f):
+        hdr = tk.Frame(f, bg=COLORS["bg_card"])
+        hdr.pack(fill="x", padx=14, pady=(6, 2))
+        self._adv_btn = tk.Button(hdr, text="▸ Advanced", font=FONTS["badge"], fg=COLORS["accent"],
+                                  bg=COLORS["bg_card"], activebackground=COLORS["bg_card"],
+                                  activeforeground=COLORS["text_bright"], relief="flat", cursor="hand2",
+                                  anchor="w", padx=0, command=self._toggle_advanced)
+        self._adv_btn.pack(side="left")
+        self._adv_summary = tk.Label(hdr, text="", font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w")
+        self._adv_summary.pack(side="left", padx=(8, 0))
 
-        for title, var, options in (("Batch size  (blocks per API call)", self.batch_size, BATCH_OPTIONS),
-                                    ("Parallel workers  (concurrent API calls)", self.workers, WORKER_OPTIONS)):
-            tk.Label(parent, text=title, font=FONTS["small"], fg=COLORS["text_dim"],
-                     bg=COLORS["bg_card"], anchor="w").pack(fill="x", pady=(10, 2))
-            row = tk.Frame(parent, bg=COLORS["bg_card"])
-            row.pack(fill="x")
-            for val, lbl in options:
-                tk.Radiobutton(row, text=lbl.split("—")[0].strip(), variable=var, value=val,
-                               font=FONTS["tiny"], fg=COLORS["text"], bg=COLORS["bg_card"],
-                               selectcolor=COLORS["bg_input"], activebackground=COLORS["bg_card"],
-                               anchor="w").pack(side="left", padx=(4, 10))
+        self._adv_body = tk.Frame(f, bg=COLORS["bg_card"])
+        b = self._adv_body
+        r1 = tk.Frame(b, bg=COLORS["bg_card"])
+        r1.pack(fill="x", padx=14, pady=(0, 2))
+
+        def spin(parent, var, lo, hi, inc):
+            s = tk.Spinbox(parent, from_=lo, to=hi, increment=inc, textvariable=var, width=4,
+                           font=FONTS["small"], bg=COLORS["bg_input"], fg=COLORS["text"],
+                           buttonbackground=COLORS["bg_mid"], insertbackground=COLORS["text"], relief="flat",
+                           highlightbackground=COLORS["border"], highlightthickness=1)
+            _no_wheel(s)
+            return s
+        tk.Label(r1, text="Batch size", font=FONTS["tiny"], fg=COLORS["text"], bg=COLORS["bg_card"]).pack(side="left")
+        sp1 = spin(r1, self.batch_size, 5, 60, 5); sp1.pack(side="left", padx=(6, 18))
+        tk.Label(r1, text="Workers", font=FONTS["tiny"], fg=COLORS["text"], bg=COLORS["bg_card"]).pack(side="left")
+        sp2 = spin(r1, self.workers, 1, 8, 1); sp2.pack(side="left", padx=(6, 0))
+        Tooltip(sp1, "Blocks per API call (5–60). Suggested automatically from the average line length.")
+        Tooltip(sp2, "Simultaneous API calls (1–8). More is faster but can hit rate limits; the app retries.")
+
+        def check(text, var, tip):
+            c = tk.Checkbutton(b, text=text, variable=var, font=FONTS["tiny"], fg=COLORS["text"],
+                               bg=COLORS["bg_card"], selectcolor=COLORS["bg_input"],
+                               activebackground=COLORS["bg_card"], anchor="w", cursor="hand2", pady=0)
+            c.pack(fill="x", padx=14)
+            Tooltip(c, tip)
+            return c
+        check("Translate hearing-impaired cues  [door slams]  (laughs)  APPLAUSE", self.translate_cues,
+              "Cue lines are translated and keep their bracket or capital style. Untick to leave them as they are.")
+        check("Save next to the source file (skip the Save dialog)", self.same_folder,
+              "Output name: source name without its language tag + target code, e.g. Movie.pt-BR.srt.\n"
+              "Unticked: a Save dialog opens in the last folder you used (shown in Settings).")
+        self._last_dir_var = tk.StringVar(value=self._last_dir_display())
+        if self.advanced_open.get():
+            self._adv_body.pack(fill="x")
+            self._adv_btn.configure(text="▾ Advanced")
+
+    def _toggle_advanced(self):
+        if self.advanced_open.get():
+            self._adv_body.pack_forget()
+            self.advanced_open.set(False)
+            self._adv_btn.configure(text="▸ Advanced")
+        else:
+            self._adv_body.pack(fill="x")
+            self.advanced_open.set(True)
+            self._adv_btn.configure(text="▾ Advanced")
+
+    def _update_adv_summary(self):
+        if not hasattr(self, "_adv_summary"):
+            return
+        self._adv_summary.configure(
+            text=f"batch {self._int(self.batch_size, 25, 5, 60)} · workers {self._int(self.workers, 5, 1, 8)} · "
+                 f"cues {'on' if self.translate_cues.get() else 'off'} · "
+                 f"{'same folder' if self.same_folder.get() else 'ask where to save'}")
+
+    def _last_dir_display(self) -> str:
+        d = self._last_output_dir
+        return "Last output folder: " + (d if d else "(none yet)")
+
+    # ACTION BAR ──────────────────────────────────────────────────────
+    def _build_action_bar(self, parent):
+        bar = tk.Frame(parent, bg=COLORS["bg_card"], highlightbackground=COLORS["border"], highlightthickness=1)
+        bar.pack(side="bottom", fill="x")
+        cost = tk.Frame(bar, bg=COLORS["key_bg"])
+        cost.pack(fill="x")
+        top = tk.Frame(cost, bg=COLORS["key_bg"])
+        top.pack(fill="x", padx=12, pady=(5, 0))
+        tk.Label(top, text="ESTIMATED COST", font=FONTS["badge"], fg=COLORS["accent"], bg=COLORS["key_bg"]).pack(side="left")
+        self._cost_main = tk.Label(top, text="—", font=("Consolas", 12, "bold"), fg=COLORS["text_dim"],
+                                   bg=COLORS["key_bg"], anchor="w")
+        self._cost_main.pack(side="left", padx=(10, 0))
+        self._cost_method = tk.Label(top, text="", font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["key_bg"])
+        self._cost_method.pack(side="left", padx=8)
+        exact = tk.Button(top, text="↻ exact", font=FONTS["tiny"], bg=COLORS["key_bg"], fg=COLORS["text_dim"],
+                          relief="flat", cursor="hand2", padx=4, command=lambda: self._refresh_cost(exact=True))
+        exact.pack(side="right")
+        Tooltip(exact, "Count the real input tokens with the free count_tokens endpoint (needs the API key)")
+        self._cost_detail = tk.Label(cost, text="", font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["key_bg"],
+                                     anchor="w", justify="left")
+        self._cost_detail.pack(fill="x", padx=12, pady=(0, 5))
+
+        btns = tk.Frame(bar, bg=COLORS["bg_card"])
+        btns.pack(fill="x", padx=12, pady=(8, 2))
+        self.start_btn = tk.Button(btns, text="▶  Start Translation", font=FONTS["heading"],
+                                   bg=COLORS["btn_primary"], fg="#ffffff", relief="flat",
+                                   activebackground=COLORS["btn_hover"], activeforeground="#ffffff",
+                                   cursor="hand2", pady=6, command=lambda: self._start(sample=False))
+        self.start_btn.pack(fill="x")
+        row = tk.Frame(btns, bg=COLORS["bg_card"])
+        row.pack(fill="x", pady=(5, 0))
+        self.sample_btn = self._flat_btn(row, f"◐  Sample ({SAMPLE_BLOCKS} blocks)", lambda: self._start(sample=True), pady=5)
+        self.sample_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        Tooltip(self.sample_btn, f"Translate only the first {SAMPLE_BLOCKS} blocks, show them in Comparison\n"
+                                 "with the real cost, save nothing.")
+        self.cancel_btn = self._flat_btn(row, "✕  Cancel", self._cancel, danger=True, pady=5)
+        self.cancel_btn.configure(state="disabled")
+        self.cancel_btn.pack(side="left", fill="x", expand=True, padx=(3, 0))
+
+        prog = tk.Frame(bar, bg=COLORS["bg_card"])
+        prog.pack(fill="x", padx=12, pady=(3, 5))
+        self.pct_label = tk.Label(prog, text="", font=FONTS["tiny"], fg=COLORS["accent"], bg=COLORS["bg_card"],
+                                  anchor="e", width=5)
+        self.pct_label.pack(side="right")
+        ttk.Progressbar(prog, variable=self.progress_var, maximum=100, style="P.Horizontal.TProgressbar"
+                        ).pack(side="left", fill="x", expand=True, pady=4)
+
+    # ── Right panel ──────────────────────────────────────────────────
+
+    def _build_right(self, parent):
+        nb = ttk.Notebook(parent, style="T.TNotebook")
+        nb.pack(fill="both", expand=True)
+        self.notebook = nb
+        self.TAB_PREVIEW, self.TAB_NAMES, self.TAB_COMPARE, self.TAB_LOG = 0, 1, 2, 3
+
+        def text_widget(frame, fg=COLORS["text"], bg=COLORS["bg_card"]):
+            return scrolledtext.ScrolledText(frame, font=FONTS["mono_sm"], bg=bg, fg=fg,
+                                             insertbackground=COLORS["text"], selectbackground=COLORS["accent"],
+                                             relief="flat", state="disabled", wrap="word", highlightthickness=0)
+
+        t1 = tk.Frame(nb, bg=COLORS["bg_card"])
+        nb.add(t1, text="  Source Preview  ")
+        self.preview_text = text_widget(t1)
+        self.preview_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.preview_text.tag_configure("id", foreground=COLORS["accent"], font=("Consolas", 10, "bold"))
+        self.preview_text.tag_configure("ts", foreground=COLORS["text_dim"], font=("Consolas", 9))
+        self.preview_text.tag_configure("txt", foreground=COLORS["text"])
+
+        t2 = tk.Frame(nb, bg=COLORS["bg_card"])
+        nb.add(t2, text="  Names  ")
+        self._build_names_tab(t2)
+
+        t3 = tk.Frame(nb, bg=COLORS["bg_card"])
+        nb.add(t3, text="  Comparison  ")
+        ch = tk.Frame(t3, bg=COLORS["bg_card"])
+        ch.pack(fill="x", padx=8, pady=(8, 4))
+        tk.Label(ch, text="ORIGINAL", font=FONTS["badge"], fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side="left", expand=True)
+        self._cmp_title = tk.Label(ch, text="TRANSLATED", font=FONTS["badge"], fg=COLORS["success"], bg=COLORS["bg_card"])
+        self._cmp_title.pack(side="right", expand=True)
+        cb = tk.PanedWindow(t3, orient="horizontal", bg=COLORS["border"], sashwidth=6,
+                            sashrelief="flat", bd=0, opaqueresize=True)
+        cb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.compare_orig = text_widget(cb, bg=COLORS["bg_input"])
+        self.compare_trans = text_widget(cb, fg=COLORS["success"], bg=COLORS["bg_input"])
+        cb.add(self.compare_orig, stretch="always", minsize=120, width=300)
+        cb.add(self.compare_trans, stretch="always", minsize=120, width=300)
+        for w in (self.compare_orig, self.compare_trans):
+            w.tag_configure("flag", foreground=COLORS["error"])
+            w.tag_configure("hdr", foreground=COLORS["text_dim"])
+            w.tag_configure("flaghdr", foreground=COLORS["warning"], font=("Consolas", 9, "bold"))
+
+        def _sync(src, dst):
+            def cb_(first, last):
+                src.vbar.set(first, last)
+                if abs(dst.yview()[0] - float(first)) > 1e-6:
+                    dst.yview_moveto(first)
+            return cb_
+        self.compare_orig.configure(yscrollcommand=_sync(self.compare_orig, self.compare_trans))
+        self.compare_trans.configure(yscrollcommand=_sync(self.compare_trans, self.compare_orig))
+
+        t4 = tk.Frame(nb, bg=COLORS["bg_card"])
+        nb.add(t4, text="  Activity Log  ")
+        self.log_text = text_widget(t4, fg=COLORS["text_dim"])
+        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
+        for tag, color in [("info", COLORS["text_dim"]), ("success", COLORS["success"]),
+                           ("warn", COLORS["warning"]), ("error", COLORS["error"]), ("accent", COLORS["accent"])]:
+            self.log_text.tag_configure(tag, foreground=color)
+
+    # NAMES TAB ───────────────────────────────────────────────────────
+    def _build_names_tab(self, t):
+        top = tk.Frame(t, bg=COLORS["bg_card"])
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        tk.Label(top, text="PRESERVE NAMES — never translated", font=FONTS["badge"], fg=COLORS["accent"],
+                 bg=COLORS["bg_card"]).pack(side="left")
+        tk.Label(top, textvariable=self._names_count, font=FONTS["tiny"], fg=COLORS["text_dim"],
+                 bg=COLORS["bg_card"]).pack(side="right")
+        tk.Label(t, text="One name per line: people, companies, schools, institutions, brands, titles. "
+                         "Countries and cities are translated normally. A <file>.names.txt next to the "
+                         "subtitle is loaded automatically.",
+                 font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w", justify="left",
+                 wraplength=520).pack(fill="x", padx=10)
+        self._gloss_text = tk.Text(t, font=FONTS["mono"], bg=COLORS["bg_input"], fg=COLORS["text"],
+                                   insertbackground=COLORS["text"], relief="flat", wrap="word",
+                                   highlightbackground=COLORS["border"], highlightthickness=1, padx=8, pady=6)
+        self._gloss_text.pack(fill="both", expand=True, padx=10, pady=(6, 4))
+        self._gloss_text.insert("1.0", self._initial_glossary)
+        self._gloss_text.bind("<KeyRelease>", lambda e: self._update_names_count())
+        row = tk.Frame(t, bg=COLORS["bg_card"])
+        row.pack(fill="x", padx=10, pady=(0, 6))
+        self._names_btn = self._flat_btn(row, "✦  Auto-detect names (Claude)", self._auto_detect_names, font=FONTS["tiny"], pady=4)
+        self._names_btn.pack(side="left")
+        Tooltip(self._names_btn, "Ask the cheapest Claude model to list the proper names in the loaded file.\n"
+                                 "Costs a fraction of a cent. Review the list before you start.")
+        self._flat_btn(row, "Save next to SRT", self._save_glossary_sidecar, dim=True, font=FONTS["tiny"], pady=4).pack(side="left", padx=(6, 0))
+        self._flat_btn(row, "Load from file…", self._load_glossary_file, dim=True, font=FONTS["tiny"], pady=4).pack(side="left", padx=(6, 0))
+        self._flat_btn(row, "Clear", self._clear_glossary, dim=True, font=FONTS["tiny"], pady=4).pack(side="right")
+        self._gloss_status = tk.Label(t, text="", font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w")
+        self._gloss_status.pack(fill="x", padx=10, pady=(0, 8))
+
+    def _glossary_text(self) -> str:
+        try:
+            return self._gloss_text.get("1.0", "end").strip()
+        except Exception:
+            return ""
+
+    def _glossary_terms(self) -> list:
+        return parse_glossary(self._glossary_text())
+
+    def _update_names_count(self):
+        n = len(self._glossary_terms())
+        self._names_count.set(f"{n} name{'s' if n != 1 else ''}")
+        try:
+            self.notebook.tab(self.TAB_NAMES, text=f"  Names ({n})  " if n else "  Names  ")
+        except Exception:
+            pass
+
+    def _merge_glossary(self, terms: list) -> int:
+        existing = {t.lower() for t in self._glossary_terms()}
+        new = [t for t in terms if t.lower() not in existing]
+        if new:
+            cur = self._glossary_text()
+            self._gloss_text.insert("end", ("\n" if cur else "") + "\n".join(new))
+        self._update_names_count()
+        self._refresh_cost()
+        return len(new)
+
+    def _clear_glossary(self):
+        self._gloss_text.delete("1.0", "end")
+        self._update_names_count()
+        self._gloss_status.configure(text="")
+        self._refresh_cost()
+
+    def _load_glossary_file(self):
+        path = filedialog.askopenfilename(title="Load names list", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            n = self._merge_glossary(parse_glossary(Path(path).read_text(encoding="utf-8")))
+            self._gloss_status.configure(text=f"Loaded {Path(path).name}: {n} new names")
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+
+    def _save_glossary_sidecar(self):
+        if not self.input_path:
+            messagebox.showwarning("No file", "Load a source SRT first.")
+            return
+        path = glossary_sidecar_path(self.input_path)
+        try:
+            path.write_text("\n".join(self._glossary_terms()) + "\n", encoding="utf-8")
+            self._gloss_status.configure(text=f"Saved: {path.name}")
+            self._log(f"Names saved to {path}", "info")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _auto_detect_names(self):
+        if not self.source_blocks:
+            messagebox.showwarning("No file", "Load a source SRT first.")
+            return
+        if not self._api_key.strip():
+            messagebox.showwarning("API Key", "Auto-detect needs a Claude API key (Settings).")
+            return
+        mid = DEFAULT_MODEL if self.catalog.has_model(DEFAULT_MODEL) else self.claude_model.get()
+        model_info = self.catalog.model(mid)
+        self._names_btn.configure(state="disabled")
+        self._gloss_status.configure(text=f"Detecting names with {model_info['display_name']}…")
+
+        def work():
+            try:
+                client = _anthropic().Anthropic(api_key=self._api_key.strip(), max_retries=2, timeout=180)
+                names, usage = extract_names(client, self.source_blocks, model_info,
+                                             _LANG_LABEL.get(self.source_lang.get(), self.source_lang.get()))
+                cost = usage.summary(self.catalog.price(mid))
+
+                def done():
+                    n = self._merge_glossary(names)
+                    self._gloss_status.configure(text=f"{len(names)} names found, {n} added  ·  cost {cost}")
+                    self._log(f"Auto-detect names: {len(names)} found, {n} added  ·  {cost}", "accent")
+                self._post(done)
+            except Exception as e:
+                msg = _err(e)
+                self._post(lambda: (self._gloss_status.configure(text=f"Failed: {msg}"),
+                                    self._log(f"Auto-detect names failed: {msg}", "error")))
+            finally:
+                self._post(lambda: self._names_btn.configure(state="normal"))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── Engine / model / catalog ─────────────────────────────────────
+
+    def _on_engine_change(self, *args):
+        sel = self.engine.get()
+        for value, b in self._eng_btns.items():
+            on = value == sel
+            b.configure(bg=COLORS["accent"] if on else COLORS["bg_input"],
+                        fg="#ffffff" if on else COLORS["text_dim"],
+                        activebackground=COLORS["accent"] if on else COLORS["border"])
+        state = "readonly" if sel == "claude" else "disabled"
+        self._model_combo.configure(state=state)
+        self._model_refresh_btn.configure(state="normal" if sel == "claude" else "disabled")
+        self._refresh_cost()
 
     def _fill_model_combo(self):
         self._model_ids = [m["id"] for m in self.catalog.models]
@@ -1640,8 +2057,12 @@ class App(tk.Tk):
             self._model_combo_var.set(values[idx])
         when = (datetime.fromtimestamp(self.catalog.models_fetched_at).strftime("%d %b %H:%M")
                 if self.catalog.models_fetched_at else "never")
-        self._models_status.configure(
-            text=f"{len(self._model_ids)} models · {self.catalog.models_source} · updated {when}")
+        pwhen = (datetime.fromtimestamp(self.catalog.prices_fetched_at).strftime("%d %b %H:%M")
+                 if self.catalog.prices_fetched_at else "never")
+        self._catalog_status.set(
+            f"Models: {len(self._model_ids)} · {self.catalog.models_source} · updated {when}\n"
+            f"Prices: {self.catalog.prices_source} · updated {pwhen}"
+            + ("\nOverride: pricing.json is active" if self.catalog.override else ""))
 
     def _on_model_selected(self, event=None):
         idx = self._model_combo.current()
@@ -1649,7 +2070,6 @@ class App(tk.Tk):
             self.claude_model.set(self._model_ids[idx])
 
     def _refresh_catalog(self, force: bool):
-        """Background: refresh prices (always) and models (if key). Then rebuild UI."""
         def work():
             msgs = []
             if force or self.catalog.prices_stale():
@@ -1669,44 +2089,22 @@ class App(tk.Tk):
                 self._refresh_cost()
                 self._log("Catalog: " + "; ".join(msgs), "info")
             self._post(done)
-        self._models_status.configure(text="refreshing…")
+        self._catalog_status.set("refreshing…")
         threading.Thread(target=work, daemon=True).start()
 
-    # ── Cost panel ───────────────────────────────────────────────────
-
-    def _build_cost_panel(self, parent):
-        self._cost_frame = tk.Frame(parent, bg=COLORS["key_bg"], highlightbackground=COLORS["border"],
-                                    highlightthickness=1)
-        self._cost_frame.pack(fill="x", pady=(10, 2))
-        hdr = tk.Frame(self._cost_frame, bg=COLORS["key_bg"])
-        hdr.pack(fill="x", padx=10, pady=(6, 2))
-        tk.Label(hdr, text="ESTIMATED COST", font=FONTS["badge"], fg=COLORS["accent"],
-                 bg=COLORS["key_bg"]).pack(side="left")
-        self._cost_method = tk.Label(hdr, text="", font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["key_bg"])
-        self._cost_method.pack(side="left", padx=8)
-        tk.Button(hdr, text="↻ exact", font=FONTS["tiny"], bg=COLORS["key_bg"], fg=COLORS["text_dim"],
-                  relief="flat", cursor="hand2", padx=4,
-                  command=lambda: self._refresh_cost(exact=True)).pack(side="right")
-        self._cost_main = tk.Label(self._cost_frame, text="Load a file to see estimate",
-                                   font=("Consolas", 12, "bold"), fg=COLORS["text_dim"],
-                                   bg=COLORS["key_bg"], anchor="w", padx=10)
-        self._cost_main.pack(fill="x")
-        self._cost_detail = tk.Label(self._cost_frame, text="", font=FONTS["tiny"], fg=COLORS["text_dim"],
-                                     bg=COLORS["key_bg"], anchor="w", padx=10, justify="left")
-        self._cost_detail.pack(fill="x", pady=(0, 6))
+    # ── Cost ─────────────────────────────────────────────────────────
 
     def _refresh_cost(self, exact: bool = False):
         if not hasattr(self, "_cost_main"):
             return
         if not self.source_blocks or self.engine.get() != "claude":
-            self._cost_main.configure(text="N/A for free engine" if self.engine.get() != "claude"
-                                      else "Load a file to see estimate", fg=COLORS["text_dim"])
-            self._cost_detail.configure(text="")
+            self._cost_main.configure(text="free" if self.engine.get() != "claude" else "—", fg=COLORS["text_dim"])
+            self._cost_detail.configure(text="MyMemory has no cost" if self.engine.get() != "claude" else "load a file")
             self._cost_method.configure(text="")
             return
         args = dict(blocks=self.source_blocks, model_id=self.claude_model.get(), catalog=self.catalog,
                     api_key=self._api_key, ctx_blocks=self.context_blocks,
-                    glossary=self._glossary_terms(), batch_size=self.batch_size.get(),
+                    glossary=self._glossary_terms(), batch_size=self._int(self.batch_size, 25, 5, 60),
                     translate_cues=self.translate_cues.get(), target_code=self.target_lang.get(),
                     src_label=_LANG_LABEL.get(self.source_lang.get(), self.source_lang.get()),
                     tgt_label=_LANG_LABEL.get(self.target_lang.get(), self.target_lang.get()))
@@ -1725,235 +2123,23 @@ class App(tk.Tk):
             return
         total = est.get("total_cost")
         if total is None:
-            self._cost_main.configure(text="price unknown for this model", fg=COLORS["warning"])
+            self._cost_main.configure(text="price unknown", fg=COLORS["warning"])
         else:
             self._cost_main.configure(
                 text="< $0.01" if total < 0.01 else f"~${total:.3f}",
                 fg=COLORS["success"] if total < 0.05 else COLORS["warning"] if total < 0.50 else COLORS["error"])
         p = est["price"]
-        price_s = (f"${p['input']:g} in / ${p['output']:g} out per MTok ({p['source']})"
+        price_s = (f"${p['input']:g} / ${p['output']:g} per MTok ({p['source']})"
                    if p["input"] is not None else "no price found")
-        detail = f"{est['input_tokens']:,} in + {est['output_tokens']:,} out tokens\n{price_s}"
+        detail = f"{est['input_tokens']:,} in + {est['output_tokens']:,} out tokens  ·  {price_s}"
         if self.context_blocks:
-            detail += "  [+context]"
+            detail += "  +context"
         self._cost_detail.configure(text=detail)
-        self._cost_method.configure(
-            text="exact input count" if est.get("method") == "exact" else "approx. — click ↻ exact")
+        self._cost_method.configure(text="exact input count" if est.get("method") == "exact" else "approx.")
 
-    # ── Glossary area ────────────────────────────────────────────────
+    # ── Settings dialog ──────────────────────────────────────────────
 
-    def _build_glossary_area(self, parent, p):
-        self._hint(parent, "One name per line. Loaded automatically from <file>.names.txt "
-                           "next to the subtitle when present.", p)
-        self._gloss_text = tk.Text(parent, height=5, font=FONTS["mono_sm"], bg=COLORS["bg_input"],
-                                   fg=COLORS["text"], insertbackground=COLORS["text"], relief="flat",
-                                   highlightbackground=COLORS["border"], highlightthickness=1, wrap="word")
-        self._gloss_text.pack(fill="x", **p)
-        self._gloss_text.insert("1.0", self._initial_glossary)
-        row = tk.Frame(parent, bg=COLORS["bg_card"])
-        row.pack(fill="x", **p, pady=(4, 0))
-        self._names_btn = self._flat_btn(row, "✦  Auto-detect names (Claude)", self._auto_detect_names,
-                                         font=FONTS["tiny"], pady=3)
-        self._names_btn.pack(side="left")
-        self._flat_btn(row, "Save next to SRT", self._save_glossary_sidecar, dim=True,
-                       font=FONTS["tiny"], pady=3).pack(side="left", padx=(6, 0))
-        self._flat_btn(row, "Clear", lambda: self._gloss_text.delete("1.0", "end"), dim=True,
-                       font=FONTS["tiny"], pady=3).pack(side="right")
-        self._gloss_status = self._hint(parent, "", p)
-
-    def _glossary_text(self) -> str:
-        try:
-            return self._gloss_text.get("1.0", "end").strip()
-        except Exception:
-            return ""
-
-    def _glossary_terms(self) -> list:
-        return parse_glossary(self._glossary_text())
-
-    def _merge_glossary(self, terms: list) -> int:
-        existing = {t.lower() for t in self._glossary_terms()}
-        new = [t for t in terms if t.lower() not in existing]
-        if new:
-            cur = self._glossary_text()
-            self._gloss_text.insert("end", ("\n" if cur else "") + "\n".join(new))
-        return len(new)
-
-    def _save_glossary_sidecar(self):
-        if not self.input_path:
-            messagebox.showwarning("No file", "Load a source SRT first.")
-            return
-        path = glossary_sidecar_path(self.input_path)
-        try:
-            path.write_text("\n".join(self._glossary_terms()) + "\n", encoding="utf-8")
-            self._gloss_status.configure(text=f"Saved: {path.name}")
-            self._log(f"Names saved to {path}", "info")
-        except Exception as e:
-            messagebox.showerror("Save failed", str(e))
-
-    def _auto_detect_names(self):
-        if not self.source_blocks:
-            messagebox.showwarning("No file", "Load a source SRT first.")
-            return
-        if not self._api_key.strip():
-            messagebox.showwarning("API Key", "Auto-detect needs a Claude API key.")
-            return
-        # Use the cheapest current model when available
-        mid = DEFAULT_MODEL if self.catalog.has_model(DEFAULT_MODEL) else self.claude_model.get()
-        model_info = self.catalog.model(mid)
-        self._names_btn.configure(state="disabled")
-        self._gloss_status.configure(text=f"Detecting names with {model_info['display_name']}…")
-
-        def work():
-            try:
-                client = _anthropic().Anthropic(api_key=self._api_key.strip(), max_retries=2, timeout=180)
-                names, usage = extract_names(client, self.source_blocks, model_info,
-                                             _LANG_LABEL.get(self.source_lang.get(), self.source_lang.get()))
-                cost = usage.summary(self.catalog.price(mid))
-
-                def done():
-                    n = self._merge_glossary(names)
-                    self._gloss_status.configure(text=f"{len(names)} names found, {n} added  ·  cost {cost}")
-                    self._log(f"Auto-detect names: {len(names)} found, {n} added  ·  {cost}", "accent")
-                    self._refresh_cost()
-                self._post(done)
-            except Exception as e:
-                msg = _err(e)
-                self._post(lambda: (self._gloss_status.configure(text=f"Failed: {msg}"),
-                                       self._log(f"Auto-detect names failed: {msg}", "error")))
-            finally:
-                self._post(lambda: self._names_btn.configure(state="normal"))
-        threading.Thread(target=work, daemon=True).start()
-
-    # ── Dropdown helpers ─────────────────────────────────────────────
-
-    def _make_dropdown(self, parent, p, textvariable):
-        values = [f"{flag}  {label}" for _, label, flag in LANGUAGES]
-        codes  = [code for code, _, _ in LANGUAGES]
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Lang.TCombobox", fieldbackground=COLORS["bg_input"], background=COLORS["bg_input"],
-                        foreground=COLORS["text"], selectbackground=COLORS["accent"],
-                        selectforeground=COLORS["text_bright"], arrowcolor=COLORS["accent"],
-                        bordercolor=COLORS["border"], lightcolor=COLORS["border"], darkcolor=COLORS["border"])
-        style.map("Lang.TCombobox", fieldbackground=[("readonly", COLORS["bg_input"])],
-                  foreground=[("readonly", COLORS["text"])])
-        try:
-            cur_idx = codes.index(textvariable.get())
-        except ValueError:
-            cur_idx = 0
-        combo_var = tk.StringVar(value=values[cur_idx])
-        combo = ttk.Combobox(parent, textvariable=combo_var, values=values, state="readonly",
-                             style="Lang.TCombobox", font=FONTS["body"])
-        combo.pack(fill="x", **p, ipady=4)
-
-        def _on_select(event=None):
-            idx = combo.current()
-            if idx >= 0:
-                textvariable.set(codes[idx])
-        combo.bind("<<ComboboxSelected>>", _on_select)
-        return combo, codes, combo_var
-
-    def _set_src_combo(self, code: str):
-        try:
-            idx = self._src_codes.index(code)
-            self._src_combo.current(idx)
-            self.source_lang.set(code)
-        except (ValueError, AttributeError):
-            pass
-
-    # ── Right panel ──────────────────────────────────────────────────
-
-    def _build_right(self, parent):
-        sty = ttk.Style()
-        sty.configure("T.TNotebook", background=COLORS["bg_dark"], borderwidth=0)
-        sty.configure("T.TNotebook.Tab", background=COLORS["bg_mid"], foreground=COLORS["text_dim"],
-                      padding=[16, 8], font=FONTS["small"], borderwidth=0)
-        sty.map("T.TNotebook.Tab", background=[("selected", COLORS["bg_card"])],
-                foreground=[("selected", COLORS["text_bright"])])
-        nb = ttk.Notebook(parent, style="T.TNotebook")
-        nb.pack(fill="both", expand=True)
-        self.notebook = nb
-
-        def text_widget(frame, fg=COLORS["text"], bg=COLORS["bg_card"]):
-            w = scrolledtext.ScrolledText(frame, font=FONTS["mono_sm"], bg=bg, fg=fg,
-                                          insertbackground=COLORS["text"], selectbackground=COLORS["accent"],
-                                          relief="flat", state="disabled", wrap="word", highlightthickness=0)
-            return w
-
-        t1 = tk.Frame(nb, bg=COLORS["bg_card"])
-        nb.add(t1, text="  Source Preview  ")
-        self.preview_text = text_widget(t1)
-        self.preview_text.pack(fill="both", expand=True, padx=8, pady=8)
-        self.preview_text.tag_configure("id", foreground=COLORS["accent"], font=("Consolas", 10, "bold"))
-        self.preview_text.tag_configure("ts", foreground=COLORS["text_dim"], font=("Consolas", 9))
-        self.preview_text.tag_configure("txt", foreground=COLORS["text"])
-
-        t2 = tk.Frame(nb, bg=COLORS["bg_card"])
-        nb.add(t2, text="  Comparison  ")
-        ch = tk.Frame(t2, bg=COLORS["bg_card"])
-        ch.pack(fill="x", padx=8, pady=(8, 4))
-        tk.Label(ch, text="ORIGINAL", font=FONTS["badge"], fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side="left", expand=True)
-        self._cmp_title = tk.Label(ch, text="TRANSLATED", font=FONTS["badge"], fg=COLORS["success"], bg=COLORS["bg_card"])
-        self._cmp_title.pack(side="right", expand=True)
-        # Resizable split: drag the sash between the two panes
-        cb = tk.PanedWindow(t2, orient="horizontal", bg=COLORS["border"], sashwidth=6,
-                            sashrelief="flat", bd=0, opaqueresize=True)
-        cb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.compare_orig = text_widget(cb, bg=COLORS["bg_input"])
-        self.compare_trans = text_widget(cb, fg=COLORS["success"], bg=COLORS["bg_input"])
-        cb.add(self.compare_orig, stretch="always", minsize=120, width=380)
-        cb.add(self.compare_trans, stretch="always", minsize=120, width=380)
-        for w in (self.compare_orig, self.compare_trans):
-            w.tag_configure("flag", foreground=COLORS["error"])
-            w.tag_configure("hdr", foreground=COLORS["text_dim"])
-            w.tag_configure("flaghdr", foreground=COLORS["warning"], font=("Consolas", 9, "bold"))
-
-        # Keep the two panes scrolled together. The "already there" check stops the
-        # two callbacks from bouncing the view between each other at idle time,
-        # which starved the redraw and left the pane blank until a resize.
-        def _sync(src, dst):
-            def cb(first, last):
-                src.vbar.set(first, last)
-                if abs(dst.yview()[0] - float(first)) > 1e-6:
-                    dst.yview_moveto(first)
-            return cb
-        self.compare_orig.configure(yscrollcommand=_sync(self.compare_orig, self.compare_trans))
-        self.compare_trans.configure(yscrollcommand=_sync(self.compare_trans, self.compare_orig))
-
-        t3 = tk.Frame(nb, bg=COLORS["bg_card"])
-        nb.add(t3, text="  Activity Log  ")
-        self.log_text = text_widget(t3, fg=COLORS["text_dim"])
-        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
-        for tag, color in [("info", COLORS["text_dim"]), ("success", COLORS["success"]),
-                           ("warn", COLORS["warning"]), ("error", COLORS["error"]), ("accent", COLORS["accent"])]:
-            self.log_text.tag_configure(tag, foreground=color)
-
-    def _build_footer(self, parent):
-        sty = ttk.Style()
-        sty.configure("P.Horizontal.TProgressbar", troughcolor=COLORS["bg_dark"],
-                      background=COLORS["accent"], borderwidth=0, thickness=6)
-        ttk.Progressbar(parent, variable=self.progress_var, maximum=100,
-                        style="P.Horizontal.TProgressbar").pack(fill="x", padx=16, pady=(8, 0))
-        sr = tk.Frame(parent, bg=COLORS["bg_mid"])
-        sr.pack(fill="x", padx=16)
-        tk.Label(sr, textvariable=self.status_text, font=FONTS["tiny"], fg=COLORS["text_dim"],
-                 bg=COLORS["bg_mid"], anchor="w").pack(side="left")
-        self.pct_label = tk.Label(sr, text="", font=FONTS["tiny"], fg=COLORS["accent"], bg=COLORS["bg_mid"], anchor="e")
-        self.pct_label.pack(side="right")
-
-    # ── Widget helpers ───────────────────────────────────────────────
-
-    def _sec(self, parent, num, title, help_cmd=None):
-        fr = tk.Frame(parent, bg=COLORS["bg_card"])
-        fr.pack(fill="x", padx=16, pady=(14, 6))
-        tk.Label(fr, text=num, font=FONTS["badge"], fg=COLORS["accent"], bg="#1a2744", padx=6, pady=1).pack(side="left")
-        tk.Label(fr, text=f"  {title}", font=FONTS["badge"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w").pack(side="left")
-        if help_cmd:
-            tk.Button(fr, text="?", font=FONTS["badge"], fg=COLORS["accent"], bg="#1a2744",
-                      activebackground=COLORS["border"], activeforeground=COLORS["text_bright"],
-                      relief="flat", cursor="hand2", padx=7, pady=0, command=help_cmd).pack(side="right")
-
-    def _show_text_dialog(self, title, text, w=620, h=520):
+    def _dialog(self, title, w, h):
         dlg = tk.Toplevel(self)
         dlg.title(title)
         dlg.configure(bg=COLORS["bg_card"])
@@ -1961,63 +2147,54 @@ class App(tk.Tk):
         self.update_idletasks()
         dlg.geometry(f"{w}x{h}+{self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)}"
                      f"+{self.winfo_rooty() + max(0, (self.winfo_height() - h) // 2)}")
-        dlg.minsize(420, 320)
-        txt = scrolledtext.ScrolledText(dlg, font=("Consolas", 9), bg=COLORS["bg_dark"], fg=COLORS["text"],
-                                        relief="flat", wrap="word", padx=18, pady=14, highlightthickness=0)
-        txt.pack(fill="both", expand=True)
-        txt.insert("1.0", text)
-        txt.tag_configure("hdr", foreground=COLORS["accent"], font=("Consolas", 9, "bold"))
-        for m in re.finditer(r"^([A-Z][A-Z /()0-9.&-]{3,})\n-{3,}", text, re.MULTILINE):
-            line_no = text[:m.start()].count("\n") + 1
-            txt.tag_add("hdr", f"{line_no}.0", f"{line_no}.end")
-        txt.configure(state="disabled")
-        self._flat_btn(dlg, "  Close  ", dlg.destroy, primary=True, padx=20, pady=5).pack(pady=(0, 14))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
+        return dlg
 
-    def _show_engine_help(self):
-        self._show_text_dialog("Translation engines", ENGINE_HELP_TEXT, 640, 560)
+    def _show_settings(self):
+        if self._settings_dlg and self._settings_dlg.winfo_exists():
+            self._settings_dlg.lift()
+            return
+        dlg = self._dialog("Settings", 560, 400)
+        dlg.resizable(False, False)
+        self._settings_dlg = dlg
+        pad = {"padx": 20}
 
-    def _eng_card(self, value, name, badge_text, badge_color, desc):
-        fr = tk.Frame(self._eng_frame, bg=COLORS["bg_input"], highlightbackground=COLORS["border"],
-                      highlightthickness=1, cursor="hand2")
-        fr.pack(fill="x", pady=3)
-        top = tk.Frame(fr, bg=COLORS["bg_input"])
-        top.pack(fill="x", padx=10, pady=(8, 2))
-        # fg is the dot colour, selectcolor the circle fill when selected: both must
-        # contrast with the dark card background or the indicator is invisible
-        rb = tk.Radiobutton(top, variable=self.engine, value=value, bg=COLORS["bg_input"],
-                            fg=COLORS["text_bright"], activeforeground=COLORS["text_bright"],
-                            selectcolor=COLORS["accent"], activebackground=COLORS["bg_input"],
-                            highlightthickness=0, cursor="hand2")
-        rb.pack(side="left")
-        nm = tk.Label(top, text=name, font=FONTS["body"], fg=COLORS["text"], bg=COLORS["bg_input"])
-        nm.pack(side="left")
-        bd = tk.Label(top, text=f" {badge_text} ", font=FONTS["badge"], fg="#ffffff", bg=badge_color)
-        bd.pack(side="right")
-        dl = tk.Label(fr, text=desc, font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_input"],
-                      anchor="w", wraplength=380)
-        dl.pack(fill="x", padx=30, pady=(0, 8))
-        for w in (fr, top, nm, bd, dl):
-            w.bind("<Button-1>", lambda e, v=value: self.engine.set(v))
-        self._eng_cards[value] = (fr, top, rb, nm, dl)
+        def section(text):
+            tk.Label(dlg, text=text, font=FONTS["badge"], fg=COLORS["accent"], bg=COLORS["bg_card"],
+                     anchor="w").pack(fill="x", pady=(16, 4), **pad)
 
-    def _on_engine_change(self, *args):
-        sel = self.engine.get()
-        for value, (fr, top, rb, nm, dl) in self._eng_cards.items():
-            on = value == sel
-            bg = COLORS["drop_active"] if on else COLORS["bg_input"]
-            fr.configure(bg=bg, highlightbackground=COLORS["accent"] if on else COLORS["border"])
-            for w in (top, rb, nm, dl):
-                w.configure(bg=bg)
-            rb.configure(activebackground=bg)
-            nm.configure(fg=COLORS["text_bright"] if on else COLORS["text"])
-        if sel == "claude":
-            self.claude_frame.pack(fill="x", padx=16, pady=(4, 4))
-        else:
-            self.claude_frame.pack_forget()
-        self._refresh_cost()
+        section("CLAUDE API KEY")
+        row = tk.Frame(dlg, bg=COLORS["bg_card"])
+        row.pack(fill="x", **pad)
+        self.key_display = tk.Label(row, text=self._mask_key(self._api_key), font=FONTS["mono_sm"],
+                                    bg=COLORS["key_bg"], fg=COLORS["text_dim"], anchor="w", padx=8, pady=5,
+                                    highlightbackground=COLORS["border"], highlightthickness=1)
+        self.key_display.pack(side="left", fill="x", expand=True)
+        self._flat_btn(row, "✎  Edit", self._edit_key, dim=True, font=FONTS["tiny"], padx=10, pady=5).pack(side="right", padx=(6, 0))
+        tk.Label(dlg, text="Stored only on this computer, sent only to api.anthropic.com. "
+                           "Get a key at console.anthropic.com.", font=FONTS["tiny"], fg=COLORS["text_dim"],
+                 bg=COLORS["bg_card"], anchor="w", wraplength=520, justify="left").pack(fill="x", pady=(3, 0), **pad)
+        self._flat_btn(dlg, "Open console.anthropic.com", lambda: webbrowser.open("https://console.anthropic.com"),
+                       dim=True, font=FONTS["tiny"], pady=3).pack(anchor="w", pady=(4, 0), **pad)
 
-    # ── API key ──────────────────────────────────────────────────────
+        section("MODELS AND PRICES")
+        row2 = tk.Frame(dlg, bg=COLORS["bg_card"])
+        row2.pack(fill="x", **pad)
+        tk.Label(row2, textvariable=self._catalog_status, font=FONTS["tiny"], fg=COLORS["text"],
+                 bg=COLORS["bg_card"], anchor="w", justify="left").pack(side="left", fill="x", expand=True)
+        self._flat_btn(row2, "⟳  Refresh now", lambda: self._refresh_catalog(force=True), dim=True,
+                       font=FONTS["tiny"], pady=4).pack(side="right")
+        tk.Label(dlg, text=f"Price override file (optional): {PRICING_OVERRIDE_PATH}",
+                 font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w",
+                 wraplength=520, justify="left").pack(fill="x", pady=(4, 0), **pad)
+
+        section("FILES")
+        tk.Label(dlg, text=f"Settings file: {CONFIG_PATH}", font=FONTS["tiny"], fg=COLORS["text_dim"],
+                 bg=COLORS["bg_card"], anchor="w", wraplength=520, justify="left").pack(fill="x", **pad)
+        tk.Label(dlg, textvariable=self._last_dir_var, font=FONTS["tiny"], fg=COLORS["text_dim"],
+                 bg=COLORS["bg_card"], anchor="w", wraplength=520, justify="left").pack(fill="x", **pad)
+
+        self._flat_btn(dlg, "  Close  ", dlg.destroy, primary=True, padx=20, pady=5).pack(side="bottom", pady=(0, 14))
 
     def _mask_key(self, key: str) -> str:
         k = key.strip()
@@ -2028,16 +2205,9 @@ class App(tk.Tk):
         return k[:7] + " ••••••••••••••••••••• " + k[-4:]
 
     def _edit_key(self):
-        dlg = tk.Toplevel(self)
-        dlg.title("Edit Claude API Key")
-        dlg.configure(bg=COLORS["bg_card"])
+        dlg = self._dialog("Edit Claude API Key", 460, 210)
         dlg.resizable(False, False)
-        dlg.transient(self)
         dlg.grab_set()
-        self.update_idletasks()
-        w, h = 460, 210
-        dlg.geometry(f"{w}x{h}+{self.winfo_rootx() + (self.winfo_width() - w) // 2}"
-                     f"+{self.winfo_rooty() + (self.winfo_height() - h) // 2}")
         tk.Label(dlg, text="Update Claude API Key", font=FONTS["heading"], fg=COLORS["text_bright"],
                  bg=COLORS["bg_card"]).pack(pady=(18, 2))
         tk.Label(dlg, text="Paste your key. Stored locally, sent only to api.anthropic.com.",
@@ -2058,7 +2228,10 @@ class App(tk.Tk):
 
         def save():
             self._api_key = var.get().strip()
-            self.key_display.configure(text=self._mask_key(self._api_key))
+            try:
+                self.key_display.configure(text=self._mask_key(self._api_key))
+            except Exception:
+                pass
             save_config({"api_key": self._api_key})
             dlg.destroy()
             self._refresh_catalog(force=True)
@@ -2067,31 +2240,29 @@ class App(tk.Tk):
         self._flat_btn(br, "Save", save, primary=True, padx=18).pack(side="left", padx=6)
         self._flat_btn(br, "Cancel", dlg.destroy, dim=True, padx=18).pack(side="left", padx=6)
         ent.bind("<Return>", lambda e: save())
-        ent.bind("<Escape>", lambda e: dlg.destroy())
         dlg.wait_window()
 
-    # ── Help ─────────────────────────────────────────────────────────
+    # ── Help dialogs ─────────────────────────────────────────────────
 
-    def _show_help(self):
-        dlg = tk.Toplevel(self)
-        dlg.title(f"Help — {APP_TITLE}")
-        dlg.configure(bg=COLORS["bg_card"])
-        dlg.transient(self)
-        self.update_idletasks()
-        w, h = 700, 640
-        dlg.geometry(f"{w}x{h}+{self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)}"
-                     f"+{self.winfo_rooty() + max(0, (self.winfo_height() - h) // 2)}")
-        dlg.minsize(520, 420)
+    def _show_text_dialog(self, title, text, w=640, h=560):
+        dlg = self._dialog(title, w, h)
+        dlg.minsize(420, 320)
         txt = scrolledtext.ScrolledText(dlg, font=("Consolas", 9), bg=COLORS["bg_dark"], fg=COLORS["text"],
                                         relief="flat", wrap="word", padx=18, pady=14, highlightthickness=0)
         txt.pack(fill="both", expand=True)
-        txt.insert("1.0", HELP_TEXT)
+        txt.insert("1.0", text)
         txt.tag_configure("hdr", foreground=COLORS["accent"], font=("Consolas", 9, "bold"))
-        for m in re.finditer(r"^([A-Z][A-Z /()0-9.&-]{3,})\n-{3,}", HELP_TEXT, re.MULTILINE):
-            line_no = HELP_TEXT[:m.start()].count("\n") + 1
+        for m in re.finditer(r"^([A-Z][A-Z /()0-9.&-]{3,})\n-{3,}", text, re.MULTILINE):
+            line_no = text[:m.start()].count("\n") + 1
             txt.tag_add("hdr", f"{line_no}.0", f"{line_no}.end")
         txt.configure(state="disabled")
         self._flat_btn(dlg, "  Close  ", dlg.destroy, primary=True, padx=20, pady=5).pack(pady=(0, 14))
+
+    def _show_help(self):
+        self._show_text_dialog(f"Help — {APP_TITLE}", HELP_TEXT, 700, 640)
+
+    def _show_engine_help(self):
+        self._show_text_dialog("Translation engines", ENGINE_HELP_TEXT, 640, 560)
 
     # ── File handling ────────────────────────────────────────────────
 
@@ -2122,6 +2293,20 @@ class App(tk.Tk):
             return None
         return path, blocks, enc.upper().replace("-SIG", "+BOM")
 
+    def _update_file_info(self):
+        if not self.source_blocks:
+            return
+        b = self.source_blocks
+        avg = sum(len(" ".join(x["text_lines"])) for x in b) / len(b)
+        n_cues = sum(1 for x in b for l in x["text_lines"] if is_cue(l))
+        detected = _LANG_LABEL.get(self._detected_code, self._detected_code)
+        out_name = default_output_name(self.input_path, self.target_lang.get())
+        if len(out_name) > 52:
+            out_name = "…" + out_name[-49:]
+        self.file_info.configure(
+            text=f"{len(b):,} blocks  ·  {self._enc_short}  ·  {detected}  ·  {n_cues} cue lines  ·  "
+                 f"avg {avg:.0f} chars\nOutput: {out_name}")
+
     def _load_source_file(self, path: str):
         loaded = self._load_srt(path, "file")
         if not loaded:
@@ -2131,22 +2316,17 @@ class App(tk.Tk):
         self.translated_blocks = []
         self.qc_issues = []
         self.input_path = path
-        name = Path(path).name
-        self.file_label.configure(text=name, fg=COLORS["text_bright"])
-        n_cues = sum(1 for b in blocks for l in b["text_lines"] if is_cue(l))
-        n_empty = sum(1 for b in blocks if not b["text_lines"])
-        self.file_info.configure(text=f"{len(blocks):,} blocks  •  IDs {blocks[0]['id']}–{blocks[-1]['id']}"
-                                      f"  •  {enc_short}  •  {n_cues} cue lines"
-                                      + (f"  •  {n_empty} empty" if n_empty else ""))
-        avg = sum(len(" ".join(b["text_lines"])) for b in blocks) / len(blocks)
+        self._enc_short = enc_short
+        self._detected_code = detect_language(blocks)
+        self.file_label.configure(text=Path(path).name, fg=COLORS["text_bright"])
         sug = suggest_batch_size(blocks)
         self.batch_size.set(sug)
-        self.batch_hint.configure(text=f"Auto batch: {sug}  (avg {avg:.0f} chars/block)")
-        detected = detect_language(blocks)
-        self._set_src_combo(detected)
+        self._set_src_combo(self._detected_code)
+        self._update_file_info()
         self._src_drop.configure(highlightbackground=COLORS["success"], bg=COLORS["bg_input"])
-        self._log(f"Loaded: {name} — {len(blocks):,} blocks  [{enc_short}]  •  {n_cues} cue lines", "accent")
-        self._log(f"Detected: {_LANG_LABEL.get(detected, detected)}  •  avg {avg:.0f} chars/block  •  auto batch={sug}", "info")
+        n_cues = sum(1 for b in blocks for l in b["text_lines"] if is_cue(l))
+        self._log(f"Loaded: {Path(path).name} — {len(blocks):,} blocks  [{enc_short}]  •  {n_cues} cue lines", "accent")
+        self._log(f"Detected: {_LANG_LABEL.get(self._detected_code, self._detected_code)}  •  auto batch={sug}", "info")
 
         sidecar = glossary_sidecar_path(path)
         if sidecar.exists():
@@ -2156,9 +2336,9 @@ class App(tk.Tk):
                 self._log(f"Names file: {sidecar.name} — {n} new names added", "info")
             except Exception as e:
                 self._log(f"Could not read {sidecar.name}: {e}", "warn")
-        self._update_out_name()
         self._show_preview()
         self._refresh_cost()
+        self.status_text.set("Check the estimate, then press Start (or Sample to try the first blocks)")
 
     def _load_context_file(self, path: str):
         loaded = self._load_srt(path, "context file")
@@ -2169,8 +2349,8 @@ class App(tk.Tk):
             b["_ms"] = timestamp_ms(b["timestamp"])
         self.context_blocks = blocks
         self.context_path = path
-        self._ctx_label.configure(text=f"✓  {Path(path).name}  ({len(blocks):,} blocks  [{enc_short}])",
-                                  fg=COLORS["success"])
+        self._ctx_label.configure(text=f"Context: {Path(path).name}  ({len(blocks):,} blocks)", fg=COLORS["success"])
+        self._ctx_add_btn.pack_forget()
         self._ctx_clear_btn.pack(side="right")
         self._log(f"Context: {Path(path).name} — {len(blocks):,} blocks  [{enc_short}]", "info")
         self._refresh_cost()
@@ -2178,8 +2358,9 @@ class App(tk.Tk):
     def _clear_context(self):
         self.context_blocks = []
         self.context_path = ""
-        self._ctx_label.configure(text="Drop context .srt here  or  Browse…", fg=COLORS["text_dim"])
+        self._ctx_label.configure(text="Context: none", fg=COLORS["text_dim"])
         self._ctx_clear_btn.pack_forget()
+        self._ctx_add_btn.pack(side="right")
         self._refresh_cost()
 
     def _show_preview(self):
@@ -2194,6 +2375,7 @@ class App(tk.Tk):
         if len(self.source_blocks) > 50:
             self.preview_text.insert("end", f"\n... and {len(self.source_blocks) - 50:,} more blocks\n", "ts")
         self.preview_text.configure(state="disabled")
+        self.notebook.select(self.TAB_PREVIEW)
 
     # ── Translation ──────────────────────────────────────────────────
 
@@ -2208,7 +2390,7 @@ class App(tk.Tk):
         if not output:
             return None
         self._last_output_dir = str(Path(output).parent)
-        self._last_dir_label.configure(text=self._last_dir_display())
+        self._last_dir_var.set(self._last_dir_display())
         return output
 
     def _start(self, sample: bool):
@@ -2216,11 +2398,12 @@ class App(tk.Tk):
             return
         if not self.source_blocks:
             messagebox.showwarning("No File", "Please load an SRT file first.")
+            self.status_text.set("Load a .srt file to begin")
             return
         engine = self.engine.get()
         if engine == "claude":
             if not self._api_key.strip():
-                messagebox.showwarning("API Key", "No Claude API key set.\nClick the Edit button.")
+                messagebox.showwarning("API Key", "No Claude API key set.\nOpen ⚙ Settings to add one.")
                 return
             if _try_import("anthropic") is None:
                 if ensure_dependencies(self):
@@ -2247,41 +2430,53 @@ class App(tk.Tk):
         self.start_btn.configure(state="disabled")
         self.sample_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
-        self.notebook.select(2)
+        self.notebook.select(self.TAB_LOG)
+        self.status_text.set("Translating…")
 
-        bsize = self.batch_size.get()
+        bsize = self._int(self.batch_size, 25, 5, 60)
         model_lbl = self.catalog.model(self.claude_model.get())["display_name"] if engine == "claude" else "MyMemory"
         glossary = self._glossary_terms()
         self._log("═" * 50, "info")
         self._log(f"{'SAMPLE RUN' if sample else 'Starting'}: {_LANG_LABEL.get(self.source_lang.get())} → "
                   f"{_LANG_LABEL.get(self.target_lang.get())}", "accent")
         self._log(f"Engine  : {model_lbl}", "info")
-        self._log(f"Blocks  : {len(blocks):,}  │  Batch: {bsize}  │  Workers: {self.workers.get()}  │  "
+        self._log(f"Blocks  : {len(blocks):,}  │  Batch: {bsize}  │  Workers: {self._int(self.workers, 5, 1, 8)}  │  "
                   f"Cues: {'translate' if self.translate_cues.get() else 'keep'}", "info")
         self._log(f"Context : {Path(self.context_path).name if self.context_blocks and engine == 'claude' else 'none'}"
                   f"  │  Names : {len(glossary)}", "info")
         if not sample:
             self._log(f"Output  : {self.output_path}", "info")
         self._log("═" * 50, "info")
-        threading.Thread(target=self._worker, args=(blocks, sample, glossary), daemon=True).start()
+        # Snapshot every setting on the main thread: Tk variables must not be read from the worker
+        run = {
+            "engine": engine, "model_id": self.claude_model.get(), "bsize": bsize,
+            "n_workers": self._int(self.workers, 5, 1, 8) if engine == "claude" else 1,
+            "cues": self.translate_cues.get(),
+            "src_code": self.source_lang.get(), "tgt_code": self.target_lang.get(),
+            "api_key": self._api_key.strip(), "output_path": self.output_path,
+            "ctx": self.context_blocks if engine == "claude" else [],
+        }
+        threading.Thread(target=self._worker, args=(blocks, sample, glossary, run), daemon=True).start()
 
-    def _worker(self, blocks: list, sample: bool, glossary: list):
+    def _worker(self, blocks: list, sample: bool, glossary: list, run: dict):
         total     = len(blocks)
-        engine    = self.engine.get()
-        src       = _LANG_LABEL.get(self.source_lang.get(), self.source_lang.get())
-        tgt       = _LANG_LABEL.get(self.target_lang.get(), self.target_lang.get())
-        model_id  = self.claude_model.get()
+        engine    = run["engine"]
+        src_code, tgt_code = run["src_code"], run["tgt_code"]
+        src       = _LANG_LABEL.get(src_code, src_code)
+        tgt       = _LANG_LABEL.get(tgt_code, tgt_code)
+        model_id  = run["model_id"]
         model     = self.catalog.model(model_id)
         price     = self.catalog.price(model_id)
-        bsize     = max(1, self.batch_size.get())
-        n_workers = self.workers.get() if engine == "claude" else 1
-        cues      = self.translate_cues.get()
-        ctx       = self.context_blocks if engine == "claude" else []
+        bsize     = run["bsize"]
+        n_workers = run["n_workers"]
+        cues      = run["cues"]
+        ctx       = run["ctx"]
+        output_path = run["output_path"]
         usage     = UsageTotals()
         errors    = []
         client    = None
         if engine == "claude":
-            client = _anthropic().Anthropic(api_key=self._api_key.strip(), max_retries=3, timeout=180)
+            client = _anthropic().Anthropic(api_key=run["api_key"], max_retries=3, timeout=180)
 
         batches   = [blocks[i:i + bsize] for i in range(0, total, bsize)]
         n_batches = len(batches)
@@ -2300,8 +2495,8 @@ class App(tk.Tk):
             if engine == "claude":
                 return claude_translate_batch(client, batch, src, tgt, model, glossary,
                                               ctx_for(batch, idx), cues, usage)
-            return [{**b, "text_lines": translate_free(b["text_lines"], self.source_lang.get(),
-                                                       self.target_lang.get(), cues)} for b in batch]
+            return [{**b, "text_lines": translate_free(b["text_lines"], src_code, tgt_code, cues)}
+                    for b in batch]
 
         def keep_original(batch):
             return [{**b, "text_lines": b["text_lines"][:], "_untranslated": bool(b["text_lines"])} for b in batch]
@@ -2331,7 +2526,7 @@ class App(tk.Tk):
 
             def ui():
                 self.progress_var.set(pct)
-                self.status_text.set(f"{done_cnt[0]}/{n_batches} batches  —  {n_done:,}/{total:,} blocks  ({pct:.0f}%)")
+                self.status_text.set(f"Translating…  batch {done_cnt[0]}/{n_batches}  ·  {n_done:,}/{total:,} blocks  ({pct:.0f}%)")
                 self.pct_label.configure(text=f"{pct:.0f}%")
             self._post(ui)
 
@@ -2369,7 +2564,7 @@ class App(tk.Tk):
                             if kind in ("untranslated", "unchanged", "empty_line", "placeholder", "name", "number")})
         if retry_idx and engine == "claude" and client is not None:
             self._log(f"\n─── QUALITY CONTROL ───  {len(retry_idx)} block(s) need a second pass", "accent")
-            self._post(lambda: self.status_text.set(f"QC: retranslating {len(retry_idx)} block(s)…"))
+            self._post(lambda: self.status_text.set(f"Quality control: retranslating {len(retry_idx)} block(s)…"))
             for k in range(0, len(retry_idx), 8):
                 chunk = retry_idx[k:k + 8]
                 sub = [{kk: v for kk, v in blocks[i].items()} for i in chunk]
@@ -2398,14 +2593,14 @@ class App(tk.Tk):
         # ── Save + verify ─────────────────────────────────────────────
         if not sample:
             try:
-                write_srt(out_blocks, self.output_path)
-                self._log(f"\nFile saved: {self.output_path}", "success")
+                write_srt(out_blocks, output_path)
+                self._log(f"\nFile saved: {output_path}", "success")
             except Exception as e:
                 self._log(f"✗ Failed to write: {e}", "error")
                 self._post(self._done)
                 return
             try:
-                ob, _ = parse_srt(self.output_path)
+                ob, _ = parse_srt(output_path)
                 checks = [
                     ("Block count",    len(ob) == total),
                     ("All IDs match",  all(ob[j]["id"] == blocks[j]["id"] for j in range(min(len(ob), total)))),
@@ -2425,8 +2620,6 @@ class App(tk.Tk):
 
         if engine == "claude":
             self._log(f"Actual cost: {usage.summary(price)}", "accent")
-            if not sample and usage.calls:
-                self._last_run_cost = usage.cost(price)
         if errors:
             self._log(f"\n{len(errors)} batch error(s):", "warn")
             for err in errors[:10]:
@@ -2443,12 +2636,12 @@ class App(tk.Tk):
         if self.cancel_flag:
             self.status_text.set("Cancelled")
         elif self.translated_blocks:
-            n_issues = len(self.qc_issues)
-            self.status_text.set(f"Done — {len(self.translated_blocks):,} blocks"
-                                 + (f"  •  {n_issues} QC warning(s)" if n_issues else "  •  QC clean"))
-            self.notebook.select(1)
+            n = len({i for i, _, _ in self.qc_issues})
+            self.status_text.set(f"Done — {n} block(s) flagged, see the Comparison tab" if n
+                                 else "Done — quality control found no issues")
+            self.notebook.select(self.TAB_COMPARE)
         else:
-            self.status_text.set("Completed with errors — check Activity Log")
+            self.status_text.set("Completed with errors — check the Activity Log")
 
     def _cancel(self):
         self.cancel_flag = True

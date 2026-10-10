@@ -2,11 +2,11 @@
 
 **Translate `.srt` subtitle files while keeping timing and structure intact.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/Python-3.9%2B-blue) [![CI](https://github.com/junqueirach/srt-translator/actions/workflows/ci.yml/badge.svg)](https://github.com/junqueirach/srt-translator/actions/workflows/ci.yml) ![Version](https://img.shields.io/badge/version-0.7.0-brightgreen)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/Python-3.9%2B-blue) [![CI](https://github.com/junqueirach/srt-translator/actions/workflows/ci.yml/badge.svg)](https://github.com/junqueirach/srt-translator/actions/workflows/ci.yml) ![Version](https://img.shields.io/badge/version-0.8.0-brightgreen)
 
 <p align="center"><img src="docs/screenshots/srt-translator.png" alt="SRT Translator screenshot" width="900"></p>
 
-**Download for Windows:** get `SRT-Translator-0.7.0-win64.zip` (about 26 MB) from the [latest release](https://github.com/junqueirach/srt-translator/releases/latest). Unzip it, open the `SRT Translator` folder and double-click `SRT Translator.exe`. No Python needed. The SHA-256 checksum is in the release notes. For the Claude engine you need your own API key (see Quick start).
+**Download for Windows:** get the latest `SRT-Translator-<version>-win64.zip` (about 26 MB) from the [latest release](https://github.com/junqueirach/srt-translator/releases/latest). Unzip it, open the `SRT Translator` folder and double-click `SRT Translator.exe`. No Python needed. The SHA-256 checksum is in the release notes. For the Claude engine you need your own API key (see Quick start).
 
 > **Windows SmartScreen:** the file is not code-signed, so Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**. You can also run the app from source (see Quick start) and read every line of the code first.
 
@@ -15,9 +15,9 @@
 <p align="center"><img src="docs/screenshots/how-it-works.png" alt="How it works" width="900"></p>
 
 1. Load a `.srt` file (drag and drop or Browse). Encoding and language are detected.
-2. Pick the target language, the engine and, for Claude, the model.
-3. Check the cost estimate, optionally run a 20-block **Sample**.
-4. Press **Start**. Blocks are translated in parallel batches, checked, repaired if needed and saved as `Movie.pt-BR.srt`.
+2. Pick the target language, the engine and, for Claude, the model. Everything you need for a run is on one screen; batch size, workers and the cue option sit under **Advanced**.
+3. Check the cost estimate above the Start button, optionally run a 20-block **Sample**.
+4. Press **Start**. Blocks are translated in parallel batches, checked, repaired if needed and saved as `Movie.pt-BR.srt`. The status line at the bottom always says what to do next.
 
 ## What it does
 
@@ -47,19 +47,20 @@ pip install -r requirements.txt
 
 Optional: `pip install tkinterdnd2` enables drag and drop.
 
-For the Claude engine you need an API key from [console.anthropic.com](https://console.anthropic.com). Enter it with the **Edit** button or set the `ANTHROPIC_API_KEY` environment variable. The key is kept in `~/.srt_translator_config.json`, outside this repository, and is sent only to `api.anthropic.com`.
+For the Claude engine you need an API key from [console.anthropic.com](https://console.anthropic.com). Enter it in **⚙ Settings** or set the `ANTHROPIC_API_KEY` environment variable. The key is kept in `~/.srt_translator_config.json`, outside this repository, and is sent only to `api.anthropic.com`.
 
 ## Using the app
 
 | Step | What to do |
 |---|---|
-| Source file | Drop the `.srt` on the first box. The block count, encoding and number of cue lines are shown. |
-| Context file | Optional. A subtitle of the same film in another language. Only the lines around each batch, by timestamp, are sent to Claude. |
-| Output | Tick *Save in same folder* to skip the Save dialog. The name is the source name without its language tag, plus the target code: `Movie.en.srt` becomes `Movie.pt-BR.srt`. |
-| Languages | The source language is detected from the text; adjust if wrong. The target language is remembered. |
-| Engine and model | Claude is recommended. The model list comes from the API; `★ recommended` marks the cheapest current model. Press ↻ to refresh models and prices. |
-| Estimated cost | Shown as soon as a file is loaded. Press **↻ exact** to count the real input tokens. The real cost of each run is written in the Activity Log. |
-| Preserve names | One name per line. **Auto-detect names** asks Claude to list people, places and institutions found in the file; review the list before starting. A `Movie.names.txt` next to the subtitle is loaded automatically and can be saved with **Save next to SRT**. |
+| File | Drop the `.srt` on the box or click Browse. Block count, encoding, detected language, cue lines and the output name are shown underneath. |
+| Context | Optional, Claude only: **+ add** a subtitle of the same film in another language. Only the lines around each batch, by timestamp, are sent. |
+| Languages | Source is detected from the text; adjust if wrong. Target is remembered. ⇄ swaps them. |
+| Engine and model | Toggle **Claude API ★** or **MyMemory (free)**. The model list comes from the API; ★ marks the cheapest current model. ⟳ refreshes models and prices. The **?** explains both engines. |
+| Advanced | Batch size (5–60), workers (1–8), *Translate hearing-impaired cues*, and *Save next to the source file* (otherwise a Save dialog opens). The output name is the source name without its language tag plus the target code: `Movie.en.srt` becomes `Movie.pt-BR.srt`. |
+| Estimated cost | Shown above Start as soon as a file is loaded. Press **↻ exact** to count the real input tokens. The real cost of each run is written in the Activity Log. |
+| Names tab | One name per line. **Auto-detect names** asks Claude to list people, companies and institutions found in the file; review the list before starting. A `Movie.names.txt` next to the subtitle is loaded automatically; **Load from file…** and **Save next to SRT** manage the list. |
+| ⚙ Settings | API key, model and price catalog refresh, pricing.json location, settings file location. |
 | Sample | Translates the first 20 blocks, shows them in the Comparison tab with the real cost, saves nothing. |
 | Start | Translates everything, runs quality control, saves the file and verifies its structure. |
 
@@ -109,7 +110,7 @@ python -m pytest tests -v
 
 ## Project facts
 
-- Built in small steps, from a command-line script (`archive/versions/srt_translator R0 (no GUI).py`) to the GUI in v0.6.0 and the quality-control release v0.7.0
+- Built in small steps, from a command-line script (`archive/versions/srt_translator R0 (no GUI).py`) to the GUI in v0.6.0, the quality-control release v0.7.0 and the one-screen redesign in v0.8.0
 - `web-prototype/` holds an early React version of the interface
 - Changes per version are in [CHANGELOG.md](CHANGELOG.md)
 
