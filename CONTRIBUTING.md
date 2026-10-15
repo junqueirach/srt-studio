@@ -1,4 +1,4 @@
-# Contributing to SRT Translator
+# Contributing to SRT Studio
 
 Thanks for your interest. This is a personal project built with AI assistance (Claude) and improved in small, versioned steps, so contributions are welcome but reviewed carefully.
 

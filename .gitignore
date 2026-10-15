@@ -14,7 +14,7 @@ output/
 Saves/
 temp/
 # Models, environments, caches
-tools/
+# (tools/ holds make_icon.py, which is tracked)
 envs/
 venv/
 .venv/

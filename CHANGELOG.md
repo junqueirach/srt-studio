@@ -1,6 +1,64 @@
 # Changelog
 
-All notable changes to SRT Translator. Dates are release dates.
+All notable changes to SRT Studio (SRT Translator until v0.8.1). Dates are release dates.
+
+## v0.9.0 — 2026-10-15
+
+New name, new layout and every text subtitle format. **SRT Translator is now SRT Studio.**
+
+### Added
+- **All text subtitle formats** for translation: SRT, ASS/SSA, WebVTT, MicroDVD (asks for the frame rate when the file does not declare it), SAMI, TTML, MPL2/TMP, through `pysubs2`. ASS styles, positions (`{\an4\pos(…)}`), comments and drawings are kept. Output in the same format as the source (default) or always SRT (Settings → Output). Picture subtitles (PGS `.sup`, VobSub) are refused with a clear message (they need OCR)
+- **Source check and repair** on load: text without a timing line (now kept, attached to the previous block), unreadable timings, end before start, zero duration, overlaps over 100 ms, wrong order, bad numbering, non-standard timing and **ad or credit lines** ("Subtitles by …", "www.OpenSubtitles.org", "Subtitulado por …", translator credits at the start or end; extra patterns in Settings → Repair). SOURCE › Repair › **Review…** lists them; **Repair** fixes them in the app; **Save repaired copy…** writes a `.bak` first when it replaces the original. ASS files are checked only for ad lines and impossible durations (overlaps are normal there)
+- **"Translated by AI" notice**: a block in the target language at the start of a full run's output (e.g. "Legendas traduzidas por IA (Claude Haiku 5.5)"), ending at least 0.2 s before the first dialogue, or at the end when there is no room; never added twice. On by default; text and seconds in Settings → Output
+- **32 languages** (Thai, Russian, Ukrainian, Greek, Hebrew, Hindi, Polish, Dutch, Swedish, Norwegian, Danish, Finnish, Czech, Hungarian, Romanian, Turkish, Indonesian, Vietnamese, Chinese Traditional added). Detection by alphabet first, then by common words; "language ?" instead of a wrong guess
+- **App icon** (caption bubble) for the window, the taskbar and the exe (`assets/icon.ico`, built by `tools/make_icon.py`)
+- **Recent ▾** menu and recent files on the start screen (last 8)
+- **Sample from the middle** (default): the 20 blocks with the busiest dialogue after the opening; "from the start" still available
+- **Estimate vs actual** line in the Log after every Claude run; the last 50 runs are kept (`cost_history`) to tune the estimate later
+- **Output encoding**: UTF-8 with BOM (default), UTF-8 without BOM, or the same as the source (with a safe fallback)
+- **Save log…** on the Log tab (Ctrl+S)
+- **Open folder** link in the status bar after a saved run
+- Keyboard: Ctrl+O, Ctrl+Enter, Esc, Ctrl+1/2/3
+
+### Changed
+- **New layout** (approved mockup): slim toolbar, **adjustable divider** between the left and right sides (drag either way; both sides keep their proportion when the window is resized; double-click or Settings → General → Reset layout restores it; default left width 460 px, so long language names show in full), left column that never scrolls and never grows (Options is a summary with Edit…), one **Subtitles** table instead of Source Preview + Comparison (source and translation side by side, time on one line, filters All / Flagged / Repaired, search, detail strip), status bar with progress, last cost and Open folder. Default window 1280×800, minimum 1100×700. Sharper text on 125 %/150 % displays
+- **Renamed to SRT Studio**: window title, files (`srt_studio_v0.9.0.py`, `SRT Studio.bat`), settings file `~/.srt_studio_config.json`. The SRT Translator settings are imported once on the first start; the old file is kept unchanged
+- Settings dialog has pages: General, Output, Repair, Files
+- Engine is chosen in a Provider drop-down (ready for more providers)
+- Drag and drop works on the whole start screen, the source card and the table; `tkinterdnd2` is now a normal requirement. Without it, the start screen says "Open a subtitle" instead of "Drop"
+- Cost amounts use one format everywhere (`~$0.0185`)
+
+### Fixed
+- **Times with a leading zero in the milliseconds were misread** (`,048` was read as 480 ms). This affected which context lines were sent with each batch; it would have broken repair and sync
+- **Text after a blank line inside a block was silently dropped** by the SRT parser; it is now kept and reported
+- MicroDVD files that declare their frame rate lost their first line
+- MicroDVD files saved with an older `pysubs2` (below 1.9, e.g. on Python 3.10) could not be opened again: the frame-rate line was written as `{0}{0}` instead of `{1}{1}`
+
+## v0.8.1 — 2026-10-15
+
+Fix release. The translation engine and the layout are unchanged.
+
+### Added
+- **"Translation finished" message** after a saved translation: file and folder, blocks and flags, structure check, the real cost of the run next to the estimate, the **total for this subtitle** (run + sample runs + name detection) and where the prices came from (live page, cache, `pricing.json`, or the built-in table with an "may be out of date" warning). Buttons: Open folder, Show flagged blocks, OK. Settings → new **OUTPUT** section: "Show a message when a translation finishes" (on by default)
+- Sample and cancelled runs show their cost in the status line ("Sample done — 20 blocks · cost $0.0031", "Cancelled — cost so far $0.0042")
+- Model drop-down tooltip with the full model details
+
+### Changed
+- **Names belong to one subtitle.** The list starts empty; loading a different subtitle clears it and loads that file's `.names.txt`. If the list holds names that are not saved, the app asks first (Yes saves them next to the old subtitle, No discards them, Cancel keeps the old subtitle). A run never clears the list. The settings file now stores the list together with its file and restores it only for that file; the v0.8.0 list is not carried over
+- Shorter model labels: `Claude Haiku 5.5 · $0.10/$0.50 · 1M ★` (fits the column; "recommended" is no longer cut off)
+- Loading another subtitle is refused while a translation runs
+- `tests/test_core.py` finds the app by version number (v0.10.0 sorts after v0.9.0) and accepts both `srt_translator_v*.py` and `srt_translator_gui_v*.py`
+- `SRT Translator.bat` starts the highest-version app file in its own folder, never a helper module or simply the newest `.py`
+
+### Fixed
+- **Subtitles saved as UTF-16 or UTF-32 did not load** ("No subtitle blocks found in file"). Windows Notepad's "Unicode" and many downloaded subtitles use UTF-16; the app tried only UTF-8 and Western codepages and mis-read every character. Byte-order marks (UTF-8, UTF-16 LE/BE, UTF-32) are now checked first, UTF-16 without a mark is recognised, and a decoding that produces NUL characters is rejected. The "no subtitles found" message now says which encoding was tried. The output is still UTF-8 with BOM
+- **A failed save was reported as "Done"** and the cost of that run was never shown. Now the status says "Not saved — <reason>", a message shows the reason and the cost, and **Save as…** saves the translation somewhere else
+- The cost of **Auto-detect names** and of **Sample** runs was never added up; the finish message now shows the total for the subtitle
+- The cost of a cancelled run was not reported
+- **Settings could be lost**: the settings file was rewritten without a lock from the main thread and from the catalog refresh thread, and an unreadable file silently reset every setting (API key included). Writes are now locked and atomic (temp file, then replace); an unreadable file is kept as `.srt_translator_config.json.corrupt-<date-time>` and the Activity Log says so. `config_version: 2` is stored
+- **Subtitles are written atomically** (temp file, then replace), so a crash or a full disk never leaves half a subtitle
+- Built-in price table re-checked against the official pricing page: Sonnet 5.5 cache read is $0.10 (was $0.20)
+- Settings dialog: the Close button no longer gets cut off when file paths wrap
 
 ## v0.8.0 — 2026-10-09
 

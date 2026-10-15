@@ -9,11 +9,11 @@ SKIP_DIRS = {".git"}
 
 
 def test_main_file_parses():
-    src = (ROOT / "srt_translator.py").read_text(encoding="utf-8")
+    src = (ROOT / "srt_studio.py").read_text(encoding="utf-8")
     ast.parse(src)
 
 def test_version_constant_present():
-    src = (ROOT / "srt_translator.py").read_text(encoding="utf-8")
+    src = (ROOT / "srt_studio.py").read_text(encoding="utf-8")
     assert re.search(r'APP_VERSION = "v?\d+\.\d+\.\d+"', src), "APP_VERSION not found"
 
 

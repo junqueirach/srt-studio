@@ -2,7 +2,7 @@
 
 ## Scope
 
-SRT Translator is a local desktop tool. It does not run a server (unless a LAN status page is explicitly enabled in the app) and it does not send your files anywhere by default. The sensitive items are:
+SRT Studio (formerly SRT Translator) is a local desktop tool. It does not run a server (unless a LAN status page is explicitly enabled in the app) and it does not send your files anywhere by default. The sensitive items are:
 
 - The Claude API key entered in the app (kept in a local settings file).
 - Files you convert, transcribe or process, which stay on your machine.
@@ -15,7 +15,7 @@ SRT Translator is a local desktop tool. It does not run a server (unless a LAN s
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for a security problem. Email **junqueira.ch@gmail.com** with the subject "Security: srt-translator" and include the version, what you observed and how to reproduce it. I aim to answer within 7 days.
+Please do not open a public issue for a security problem. Email **junqueira.ch@gmail.com** with the subject "Security: srt-studio" and include the version, what you observed and how to reproduce it. I aim to answer within 7 days.
 
 If you find a real API key anywhere in this repository or its history, tell me right away so I can revoke it.
 
