@@ -2,6 +2,34 @@
 
 All notable changes to SRT Studio (SRT Translator until v0.8.1). Dates are release dates.
 
+## v0.9.1 — 2026-10-16
+
+Fixes found after v0.9.0 and a polished window.
+
+### Fixed
+- **A run that fails is no longer reported as finished.** With a rejected API key (HTTP 401) v0.9.0 saved the untranslated text under "Legendas traduzidas por IA" and said "Translation finished". Now an error that retrying cannot fix (rejected key, model not found, refused request, MyMemory daily limit) stops the run at once: **no file is written and no AI notice is added**, and a *Translation failed* message says what happened and what to do (**Open Settings** for a key problem, **Show log**). A run in which nothing was translated at all (e.g. no connection) ends the same way
+- **Partial failures are counted honestly**: the finish message says "N of M translated", names the blocks kept in the source language (marked ⚑) and is titled *Translation finished with problems*
+- MyMemory: no connection or the daily limit ("MYMEMORY WARNING…") is reported instead of silently keeping the source text or saving the warning as a translation
+- **MyMemory AI notice** fully in the target language: "Legendas traduzidas por IA (MyMemory)" instead of "(MyMemory, machine translation)"
+- The **double-arrow cursor** of the divider stayed on over the whole window after the mouse crossed the divider quickly; both sides now keep the normal arrow
+- The "Install dependencies" question (running from source) has the app's name and icon and appears in front of other windows
+
+### Added
+- **About window** (Help ▾ › About, or click the logo): author, contact email, GitHub page, Reddit (r/SRTStudio), licence and what the app does; the links can be clicked (without a mail program the address is copied); **Copy** copies the version details for bug reports
+- **Help ▾ menu**: Help (F1), Translation engines, Check for updates…, About
+- **Check for updates**: asks GitHub for the latest release (nothing else is sent, nothing is downloaded); optional check at start, at most once a day (Settings → General → UPDATES, off by default) with a status-bar link when a newer version exists; "Skip this version"
+- **Dark title bar** on the main window and the app's dialogs (Windows 10 and 11; on Windows 11 in the toolbar colour). Settings → General → WINDOW, on by default
+- New settings keys: `dark_title_bar`, `check_updates`, `last_update_check`, `skipped_version`
+
+### Changed
+- **Title-bar icon** without the dark square: a transparent bubble (`assets/icon-small.ico`, 16–32 px) is used for the title bar; the taskbar, Alt+Tab and the exe keep the tile
+- **Subtitles table**: before a run the Source column uses the width; when translations arrive Source and Translation share it. Column widths you set by dragging are kept until another file is opened
+- The line above the block text in the strip under the table uses the app font (it was Consolas)
+- The "from the middle" box next to Sample is sized from its text (it was clipped)
+- Settings → General: the price override file shows its status (found / not present), a short path with the full path in the tooltip, **Open folder** and **Copy path**
+- README links point to the renamed repository `junqueirach/srt-studio`; User-Agent `SRT-Studio/<version>`
+- Tests: 127 → 148 (failed and partial runs with a fake client, MyMemory errors, notice text, icons, update check, column widths, About, Help menu, cursor); the window tests skip on a machine without a display (GitHub CI). (the Windows GUI harness is kept outside this repository)
+
 ## v0.9.0 — 2026-10-15
 
 New name, new layout and every text subtitle format. **SRT Translator is now SRT Studio.**
@@ -32,7 +60,6 @@ New name, new layout and every text subtitle format. **SRT Translator is now SRT
 - **Times with a leading zero in the milliseconds were misread** (`,048` was read as 480 ms). This affected which context lines were sent with each batch; it would have broken repair and sync
 - **Text after a blank line inside a block was silently dropped** by the SRT parser; it is now kept and reported
 - MicroDVD files that declare their frame rate lost their first line
-- MicroDVD files saved with an older `pysubs2` (below 1.9, e.g. on Python 3.10) could not be opened again: the frame-rate line was written as `{0}{0}` instead of `{1}{1}`
 
 ## v0.8.1 — 2026-10-15
 

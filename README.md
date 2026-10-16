@@ -3,11 +3,11 @@
 **Translate and repair subtitle files (SRT, ASS, WebVTT and more) while keeping timing and structure intact.**
 Formerly *SRT Translator* (renamed in v0.9.0).
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/Python-3.9%2B-blue) [![CI](https://github.com/junqueirach/srt-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/junqueirach/srt-studio/actions/workflows/ci.yml) ![Version](https://img.shields.io/badge/version-0.9.0-brightgreen)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) ![Python](https://img.shields.io/badge/Python-3.9%2B-blue) [![CI](https://github.com/junqueirach/srt-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/junqueirach/srt-studio/actions/workflows/ci.yml) ![Version](https://img.shields.io/badge/version-0.9.1-brightgreen)
 
 <p align="center"><img src="docs/screenshots/srt-studio.png" alt="SRT Studio screenshot" width="900"></p>
 
-**Download for Windows:** get the latest `SRT-Studio-<version>-win64.zip` from the [latest release](https://github.com/junqueirach/srt-studio/releases/latest). Unzip it, open the `SRT Studio` folder and double-click `SRT Studio.exe`. No Python needed. The SHA-256 checksum is in the release notes. For the Claude engine you need your own API key (see Quick start).
+**Download for Windows:** the current Windows build is v0.9.0: [`SRT-Studio-0.9.0-win64.zip`](https://github.com/junqueirach/srt-studio/releases/download/v0.9.0/SRT-Studio-0.9.0-win64.zip) (about 26 MB). v0.9.1 is a source-only release (run it with Python, see Quick start); the next Windows build comes with v0.10.0. Unzip it, open the `SRT Studio` folder and double-click `SRT Studio.exe`. No Python needed. The SHA-256 checksum is in the [v0.9.0 release notes](https://github.com/junqueirach/srt-studio/releases/tag/v0.9.0). For the Claude engine you need your own API key (see Quick start).
 
 > **Windows SmartScreen:** the file is not code-signed, so Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**. You can also run the app from source (see Quick start) and read every line of the code first.
 
@@ -51,7 +51,7 @@ For the Claude engine you need an API key from [console.anthropic.com](https://c
 
 | Part | What it does |
 |---|---|
-| Toolbar | **Open…**, **Recent ▾** (last 8 files), **⚙ Settings**, **? Help**. |
+| Toolbar | **Open…**, **Recent ▾** (last 8 files), **⚙ Settings**, **Help ▾** (Help, Translation engines, Check for updates…, About). Click the logo for **About** (author, contact, GitHub, Reddit, licence). |
 | Left side | **SOURCE**: file name, format / encoding / blocks / language labels, **Repair** status with **Review…**, optional **Context** file. **LANGUAGES**: source (detected) and target, ⇄ swaps them. **ENGINE**: provider and model (★ = the cheapest current model; hover for details). **OPTIONS**: a one-line summary with **Edit…** (batch size, workers, cues, save next to source, AI notice, sample from). At the bottom: estimated cost (**↻ exact** counts the real input tokens), **Start**, **Sample** and **Cancel**. |
 | Divider | Drag it to make either side wider. When the window is resized, both sides keep their proportion. Double-click it, or Settings → General → Reset layout, to go back to the default. |
 | Subtitles tab | One row per block: number, time, source, translation (filled during the run), ⚑ flag. Show *All / Flagged / Repaired*, search text or a number; the strip below shows the selected block in full. |
@@ -59,8 +59,9 @@ For the Claude engine you need an API key from [console.anthropic.com](https://c
 | Log tab | Batch progress, quality-control report, repair log, real cost and "estimate vs actual". **Save log…** writes it to a text file. |
 | Status bar | What is happening, the progress bar, the last cost, and **Open folder** after a saved run. |
 | Finish message | The saved file, flagged blocks, structure check, the cost of the run next to the estimate, the total for this subtitle and where the prices came from. If saving fails, it says why, shows the cost and offers **Save as…**. Can be turned off in Settings → Output. |
-| Settings | **General**: API key, models and prices, reset layout. **Output**: finish message, output format, encoding, AI notice. **Repair**: remove ad and credit lines, extra patterns. **Files**: where the settings file is. |
-| Keyboard | Ctrl+O open · Ctrl+Enter start · Esc cancel · Ctrl+1/2/3 tabs · Ctrl+S save the log (Log tab). |
+| Failure message | When a run cannot work (API key rejected, model not found, no connection, MyMemory daily limit) it stops at once: **no file is written and no AI notice is added**, and a *Translation failed* message says what happened and what to do. When only some batches fail, the file is saved and the message counts only the blocks that really changed; the others are named and marked ⚑. |
+| Settings | **General**: API key, models and prices, the optional `pricing.json` (found / not present, Open folder), reset layout, dark title bar, check for updates at start (off by default). **Output**: finish message, output format, encoding, AI notice. **Repair**: remove ad and credit lines, extra patterns. **Files**: where the settings file is. |
+| Keyboard | Ctrl+O open · Ctrl+Enter start · Esc cancel · Ctrl+1/2/3 tabs · Ctrl+S save the log (Log tab) · F1 Help. |
 
 ## Quality control
 
@@ -102,20 +103,29 @@ Cue lines written as `[door slams]`, `(laughs)` or `APPLAUSE` are translated and
 ```
 pip install -r requirements.txt pytest
 python -m pytest tests -v
-python tools/make_icon.py        # rebuilds assets/icon.ico from the drawing (needs Pillow)
+python tools/make_icon.py        # rebuilds assets/icon.ico and icon-small.ico from the drawing (needs Pillow)
 ```
 
 `tests/test_core.py` covers parsing (all formats), repair, the AI notice, language detection, naming, cues, tags, the glossary, the pricing parser, the cost estimate and ledger, the batch protocol with a fake client, and quality control. No API key or network is needed.
 
 ## Project facts
 
-- Built in small steps, from a command-line script (`archive/versions/srt_translator R0 (no GUI).py`) to the GUI in v0.6.0, the quality-control release v0.7.0, the one-screen redesign in v0.8.0, the fixes in v0.8.1 and, in v0.9.0, the new name, layout and icon, all text subtitle formats, source repair and the AI notice
-- About 4,700 lines of Python in one file (`srt_studio.py`), 127 automated tests, 12 versions (the 11 earlier files are in `archive/versions/`)
+- Built in small steps, from a command-line script (`archive/versions/srt_translator R0 (no GUI).py`) to the GUI in v0.6.0, the quality-control release v0.7.0, the one-screen redesign in v0.8.0, the fixes in v0.8.1, in v0.9.0 the new name, layout and icon, all text subtitle formats, source repair and the AI notice, and in v0.9.1 honest failure reports, the About window and a polished window
+- About 5,400 lines of Python in one file (`srt_studio.py`), 148 automated tests, 13 versions (the 12 earlier files are in `archive/versions/`)
 - `web-prototype/` holds an early React version of the interface
 - Changes per version are in [CHANGELOG.md](CHANGELOG.md)
-- Planned next: subtitle sync with AI support (not in v0.9.0; FFmpeg is not used yet)
+- Planned next (v0.10.0): subtitle sync with AI support. Not in this version; FFmpeg is not used yet
 
 ---
+
+## Community and contact
+
+- **Reddit:** [r/SRTStudio](https://www.reddit.com/r/SRTStudio/) — questions, ideas, show your results
+- **Bugs and requests:** [GitHub issues](https://github.com/junqueirach/srt-studio/issues)
+- **Email:** junqueira.ch@gmail.com
+- **New versions:** [Releases](https://github.com/junqueirach/srt-studio/releases) (the app can check for you: Help ▾ › Check for updates…)
+
+The same links are in the app under Help ▾ › About SRT Studio.
 
 ## How this was built
 

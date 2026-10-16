@@ -381,7 +381,7 @@ def test_loader_sorts_versions_as_numbers(tmp_path):
 
 
 def test_loader_picks_this_version():
-    assert st.APP_VERSION == "v0.9.0"
+    assert st.APP_VERSION == "v0.9.1"
 
 
 # ── v0.8.1 · A1: safe writes ────────────────────────────────────────
@@ -499,7 +499,7 @@ def test_finish_summary_cases():
     d, s = st.finish_summary(_result())
     assert d == "finished" and "Movie.pt-BR.srt" in s and "$0.0171" in s
     d, s = st.finish_summary(_result(sample=True, saved_path="", total=20))
-    assert d is None and s.startswith("Sample done — 20 blocks") and "$0.0171" in s
+    assert d is None and s.startswith("Sample done — 20 of 20 blocks translated") and "$0.0171" in s
     d, s = st.finish_summary(_result(cancelled=True, ok=False))
     assert d is None and s == "Cancelled — cost so far $0.0171"
     d, s = st.finish_summary(_result(ok=False, save_error="Permission denied", saved_path=""))
@@ -610,7 +610,7 @@ def test_utf16_output_roundtrip_is_utf8(tmp_path):
 # ════════════════════════════════════════════════════════════════════
 
 def test_app_renamed():
-    assert st.APP_NAME == "SRT Studio" and st.APP_VERSION == "v0.9.0"
+    assert st.APP_NAME == "SRT Studio" and st.APP_VERSION == "v0.9.1"
     assert st.CONFIG_PATH.name == ".srt_studio_config.json"
 
 
@@ -955,3 +955,336 @@ def test_write_srt_encodings_round_trip(tmp_path):
 def test_no_old_money_format_left():
     src = pathlib.Path(st.__file__).read_text(encoding="utf-8")
     assert "< $0.01" not in src and ":.3f}" not in src
+
+
+# ══ v0.9.1 ═══════════════════════════════════════════════════════════
+
+class _HTTPErr(Exception):
+    def __init__(self, status, msg="error"):
+        super().__init__(msg)
+        self.status_code = status
+        self.message = msg
+
+
+class APIConnectionError(Exception):       # same class name as the SDK's
+    pass
+
+
+# ── X1: a failed run is reported as failed, nothing is saved ─────────
+
+def test_failure_info_kinds():
+    assert st.failure_info(_HTTPErr(401, "invalid x-api-key"))["kind"] == "key"
+    assert "rejected" in st.failure_info(_HTTPErr(401))["reason"]
+    assert "Settings" in st.failure_info(_HTTPErr(401))["advice"]
+    assert st.failure_info(_HTTPErr(403))["kind"] == "key"
+    assert st.failure_info(_HTTPErr(404))["kind"] == "model"
+    assert st.failure_info(_HTTPErr(400))["kind"] == "request"
+    assert st.failure_info(_HTTPErr(529))["kind"] == "server"
+    net = st.failure_info(APIConnectionError("Connection error."))
+    assert net["kind"] == "network" and "api.anthropic.com" in net["reason"]
+    assert "MyMemory" in st.failure_info(APIConnectionError("x"), "free")["reason"]
+    assert st.failure_info(st.FreeLimitReached("x"), "free")["kind"] == "limit"
+    assert st.failure_info(st.BatchRefused("x"))["kind"] == "refused"
+    assert st._is_fatal(_HTTPErr(401)) and st._is_fatal(st.FreeLimitReached("x"))
+    assert not st._is_fatal(_HTTPErr(500)) and not st._is_fatal(APIConnectionError("x"))
+
+
+def test_finish_summary_failed_and_partial():
+    d, s = st.finish_summary(_result(ok=False, saved_path="", failed="The API key was rejected (HTTP 401).",
+                                     fail_short="API key rejected", cost=0.0))
+    assert d == "failed" and s.startswith("Failed — API key rejected") and "Done" not in s
+    d, s = st.finish_summary(_result(kept=["5", "6"]))
+    assert d == "finished" and s.startswith("Done with problems") and "2 block(s) kept" in s
+
+
+class _StubCatalog:
+    def model(self, _id):
+        return dict(st._BUILTIN_MODELS[0])
+
+    def price(self, _id):
+        return {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25, "source": "built-in"}
+
+
+def _stub_app(tmp_path):
+    ns = type("Stub", (), {})()
+    ns.catalog, ns.cancel_flag, ns.posted, ns.logs = _StubCatalog(), False, [], []
+    ns._post = ns.posted.append
+    ns._log = lambda m, tag="info": ns.logs.append((tag, m))
+    return ns
+
+
+def _run_worker(tmp_path, monkeypatch, client_cls=None, engine="claude", free=None, sample=False, n=12, bsize=4):
+    text = "".join(f"{i}\n00:00:{10 + 2 * i:02d},000 --> 00:00:{11 + 2 * i:02d},000\nLine number {i} here\n\n"
+                   for i in range(1, n + 1))
+    blocks = st.parse_srt_text(text)
+    src = tmp_path / "Movie.en.srt"
+    src.write_text(text, encoding="utf-8")
+    doc = st.load_subtitle(str(src))
+    out = tmp_path / "Movie.pt-BR.srt"
+    monkeypatch.setattr(st.time, "sleep", lambda s: None)
+    if client_cls:
+        monkeypatch.setattr(st, "_anthropic", lambda: type("A", (), {"Anthropic": client_cls}))
+    if free:
+        monkeypatch.setattr(st, "translate_free", free)
+    app = _stub_app(tmp_path)
+    run = {"engine": engine, "model_id": "claude-haiku-5-5", "bsize": bsize, "n_workers": 2, "cues": True,
+           "src_code": "en-US", "tgt_code": "pt-BR", "api_key": "sk-ant-test", "output_path": str(out), "ctx": [],
+           "file": str(src), "offset": 0, "doc": doc, "estimate": None, "output_format": "same",
+           "output_encoding": "utf-8-sig", "notice": not sample,
+           "notice_text": st.notice_text_for("pt-BR", "MyMemory" if engine == "free" else "Claude Haiku 5.5"),
+           "notice_secs": 4, "notice_custom": ""}
+    st.App._worker(app, doc.blocks if not sample else doc.blocks[:4], sample, [], run)
+    done = [f for f in app.posted if getattr(f, "__name__", "") == "<lambda>"]
+    result = None
+    for f in done:                        # the last posted lambda is _done(result): read result from its closure
+        for cell in (f.__closure__ or ()):
+            if isinstance(cell.cell_contents, dict) and "engine" in cell.cell_contents:
+                result = cell.cell_contents
+    return result, out, app, blocks
+
+
+def _client(fail_for):
+    """Fake anthropic client: fail_for(batch_text) → exception to raise or None (then translate)."""
+    import types
+
+    class Msgs:
+        def create(self, **kw):
+            user = kw["messages"][0]["content"]
+            err = fail_for(user)
+            if err:
+                raise err
+            out = [{"k": m.group(1), "lines": ["PT " + l for l in m.group(2).split("\n")]}
+                   for m in re.finditer(r"\[([a-z]\d\d)\]\n(.*?)(?=\n\n\[|\Z)",
+                                        user.split("SUBTITLES:\n\n", 1)[-1], re.S)]
+            return types.SimpleNamespace(stop_reason="end_turn", usage=_FakeUsage(),
+                                         content=[types.SimpleNamespace(type="text",
+                                                                        text=json.dumps({"blocks": out}))])
+
+    class Client:
+        def __init__(self, **kw):
+            self.messages = Msgs()
+    return Client
+
+
+def test_x1_rejected_key_saves_nothing(tmp_path, monkeypatch):
+    calls = []
+    result, out, app, _ = _run_worker(tmp_path, monkeypatch,
+                                      _client(lambda u: calls.append(1) or _HTTPErr(401, "invalid x-api-key")))
+    assert result["failed"] and result["fail_kind"] == "key" and not result["ok"]
+    assert not out.exists() and result["saved_path"] == ""
+    assert not any("AI notice added at the" in m for _, m in app.logs)
+    assert any("Nothing was saved" in m for _, m in app.logs)
+    assert len(calls) <= 3                       # stopped: no retries, no QC pass, the other batches skipped
+    assert st.finish_summary(result)[0] == "failed"
+
+
+def test_x1_partial_failure_counts_only_changed_blocks(tmp_path, monkeypatch):
+    # every call that contains block 6 fails with a server error (also the QC retry) → blocks 5–8 kept
+    result, out, app, blocks = _run_worker(
+        tmp_path, monkeypatch, _client(lambda u: _HTTPErr(500, "overloaded") if "Line number 6 " in u else None))
+    assert result["ok"] and not result["failed"] and out.exists()
+    assert result["translated"] == 8 and result["kept"] == ["5", "6", "7", "8"]
+    saved = st.parse_srt(str(out))[0]
+    assert saved[0]["text_lines"][0].startswith("Legendas traduzidas por IA")      # notice kept: most is translated
+    assert saved[6]["text_lines"] == ["Line number 6 here"]
+    assert st.finish_summary(result)[1].startswith("Done with problems")
+
+
+def test_x1_nothing_changed_is_a_failure(tmp_path, monkeypatch):
+    result, out, _, _ = _run_worker(tmp_path, monkeypatch, engine="free",
+                                    free=lambda lines, s, t, c=True: list(lines))
+    assert result["failed"] and result["fail_kind"] == "unchanged" and not out.exists()
+
+
+def test_x1_mymemory_offline_and_daily_limit(tmp_path, monkeypatch):
+    class Req:
+        utils = type("U", (), {"quote": staticmethod(lambda s: s)})
+
+        def __init__(self, mode):
+            self.mode = mode
+
+        def get(self, url, timeout=10):
+            if self.mode == "offline":
+                raise APIConnectionError("no route")
+            body = {"responseStatus": 200, "responseData": {"translatedText": "MYMEMORY WARNING: YOU USED ALL "
+                                                                               "AVAILABLE FREE TRANSLATIONS"}}
+            return type("R", (), {"json": lambda self: body})()
+    monkeypatch.setattr(st, "_requests", lambda: Req("offline"))
+    with pytest.raises(APIConnectionError):
+        st.translate_free(["Hello there", "General Kenobi"], "en-US", "pt-BR")
+    assert st.translate_free(["♪", "123"], "en-US", "pt-BR") == ["♪", "123"]      # nothing asked → no error
+    monkeypatch.setattr(st, "_requests", lambda: Req("limit"))
+    with pytest.raises(st.FreeLimitReached):
+        st.translate_free(["Hello there"], "en-US", "pt-BR")
+
+
+def test_x1_sample_failure_reports(tmp_path, monkeypatch):
+    result, out, _, _ = _run_worker(tmp_path, monkeypatch, _client(lambda u: _HTTPErr(401)), sample=True)
+    assert result["failed"] and result["sample"] and not out.exists()
+
+
+# ── X2: MyMemory notice fully in the target language ────────────────
+
+def test_x2_mymemory_notice_label():
+    assert st.notice_text_for("pt-BR", "MyMemory") == "Legendas traduzidas por IA (MyMemory)"
+    for code, _, _ in st.LANGUAGES:
+        assert "machine translation" not in st.notice_text_for(code, "MyMemory") or code.startswith("en")
+    assert "MyMemory, machine translation" not in pathlib.Path(st.__file__).read_text(encoding="utf-8")
+
+
+# ── X3: dependency question in front, with the app name ─────────────
+
+def test_x3_probe_root_named_and_on_top(gui_app):
+    import tkinter as tk
+    root = tk.Toplevel(gui_app)          # one Tk interpreter per test run: a second tk.Tk() is flaky on Windows
+    root.withdraw()
+    try:
+        st._prepare_probe_root(root)
+        assert root.title() == "SRT Studio"
+        assert bool(root.attributes("-topmost"))
+    finally:
+        root.destroy()
+
+
+# ── X4: transparent small icon for the title bar ────────────────────
+
+def test_x4_small_icon_files():
+    PIL = pytest.importorskip("PIL.Image")
+    assets = ROOT / "assets"
+    ico = PIL.open(assets / "icon-small.ico")
+    assert {(16, 16), (20, 20), (24, 24), (32, 32)} <= set(ico.info.get("sizes", ico.ico.sizes()))
+    for s in (16, 20, 24, 32):
+        small = PIL.open(assets / f"icon-small-{s}.png").convert("RGBA")
+        tile = PIL.open(assets / f"icon-{s if s != 20 else 20}.png").convert("RGBA")
+        assert small.getpixel((s // 2, 0))[3] == 0, s         # above the bubble: transparent
+        assert tile.getpixel((s // 2, 0))[3] == 255, s        # the tile's top edge: opaque
+        assert small.getpixel((s // 2, s // 2))[3] == 255, s  # the bubble itself is solid
+
+
+def test_x4_x6_helpers_never_raise():
+    class NoFrame:
+        def wm_frame(self):
+            raise RuntimeError("no window")
+    assert st.set_window_icons(NoFrame()) is False
+    assert st.set_dark_title_bar(NoFrame()) is False
+    assert st._colorref("#1a2331") == 0x0031231A
+
+
+# ── X5: About ───────────────────────────────────────────────────────
+
+def test_x5_identity_constants():
+    assert st.APP_CONTACT == "junqueira.ch@gmail.com"
+    assert st.APP_REPO_URL == "https://github.com/junqueirach/srt-studio"
+    assert st.APP_REDDIT == "https://www.reddit.com/r/SRTStudio/"
+    assert st.APP_LICENCE == "MIT" and len(st.APP_FEATURES) >= 6
+    info = st.app_version_info("8.6.13")
+    assert info.startswith("SRT Studio 0.9.1 · ") and "Python " in info and "Tk 8.6.13" in info
+    assert "srt-translator/" not in pathlib.Path(st.__file__).read_text(encoding="utf-8")
+
+
+# ── X7: Subtitles table column widths ───────────────────────────────
+
+def test_x7_column_widths():
+    assert st.table_column_widths(800, False, 170) == (630, 170)
+    assert st.table_column_widths(800, True, 170) == (400, 400)
+    assert st.table_column_widths(801, True, 170) == (401, 400)
+    assert st.table_column_widths(200, False, 170) == (100, 100)       # narrow table: never more than half
+    assert st.table_column_widths(-5, False, 170) == (0, 0)
+
+
+# ── X11: check for updates ──────────────────────────────────────────
+
+def test_x11_versions():
+    assert st.parse_version("v0.10.0") == (0, 10, 0) and st.parse_version("0.9.1") == (0, 9, 1)
+    assert st.parse_version("latest") == () and st.parse_version(None) == ()
+    assert st.is_newer("v0.10.0", "v0.9.1") and st.is_newer("0.9.10", "0.9.9")
+    assert not st.is_newer("v0.9.1", "v0.9.1") and not st.is_newer("v0.9.0", "v0.9.1")
+    assert not st.is_newer("nightly", "v0.9.1")
+
+
+def test_x11_check_latest_release_answers():
+    def fake(status=200, body=None, exc=None):
+        def get(url, timeout=5, headers=None):
+            assert url == st.RELEASES_API and "SRT-Studio/" in headers["User-Agent"]
+            if exc:
+                raise exc
+            return type("R", (), {"status_code": status, "json": lambda self: body})()
+        return get
+    r = st.check_latest_release(fake(body={"tag_name": "v0.10.0", "html_url": "https://x/rel"}))
+    assert r == {"status": "newer", "version": "0.10.0", "url": "https://x/rel", "error": ""}
+    assert st.check_latest_release(fake(body={"tag_name": "v0.9.1", "html_url": "u"}))["status"] == "latest"
+    assert st.check_latest_release(fake(body={"tag_name": "v0.8.0", "html_url": "u"}))["status"] == "latest"
+    assert st.check_latest_release(fake(status=404))["status"] == "none"
+    assert st.check_latest_release(fake(status=503))["status"] == "error"
+    assert st.check_latest_release(fake(body={"tag_name": "nightly"}))["status"] == "error"
+    r = st.check_latest_release(fake(exc=APIConnectionError("offline")))
+    assert r["status"] == "error" and "offline" in r["error"]
+
+
+# ── GUI checks (real Tk window, temporary home, no network) ─────────
+
+@pytest.fixture(scope="module")
+def gui_app(tmp_path_factory):
+    """One app window for all GUI checks (a second Tk interpreter in one process is flaky on Windows)."""
+    home = tmp_path_factory.mktemp("home")
+    mp = pytest.MonkeyPatch()
+    mp.setattr(st, "CONFIG_PATH", home / ".srt_studio_config.json")
+    mp.setattr(st, "OLD_CONFIG_PATH", home / ".srt_translator_config.json")
+    mp.setattr(st.App, "_startup_refresh", lambda self: None)          # no catalog / update fetch
+    try:
+        app = st.App()
+    except st.tk.TclError as e:          # no screen (e.g. the GitHub CI runner): skip the window checks
+        mp.undo()
+        pytest.skip(f"no display for Tk: {e}")
+    app.update_idletasks()
+    yield app
+    try:
+        app.destroy()
+    except Exception:
+        pass
+    mp.undo()
+
+
+def test_x12_sides_have_their_own_cursor(gui_app):
+    # the divider shows the double arrow; the two sides must not inherit it
+    assert gui_app._paned.cget("sashcursor") == "sb_h_double_arrow"
+    assert gui_app._left_frame.cget("cursor") == "arrow" and gui_app._right_frame.cget("cursor") == "arrow"
+
+
+def test_x5_help_menu_and_about(gui_app, monkeypatch):
+    m = gui_app._help_menu
+    labels = [m.entrycget(i, "label") for i in range(m.index("end") + 1) if m.type(i) == "command"]
+    assert labels == ["Help", "Translation engines", "Check for updates…", "About SRT Studio"]
+    opened = []
+    monkeypatch.setattr(st.webbrowser, "open", lambda url: opened.append(url) or False)
+    gui_app._show_about()
+    assert gui_app._about_rows == ["Created by", "Contact", "GitHub", "Reddit", "Licence"]
+    gui_app._open_url(st.APP_REPO_URL)
+    assert opened[-1] == st.APP_REPO_URL
+    assert gui_app._open_mail(st.APP_CONTACT) is False                    # no mail program → copied instead
+    assert opened[-1] == "mailto:junqueira.ch@gmail.com"
+    assert gui_app.clipboard_get() == st.APP_CONTACT
+    gui_app._about_dlg.destroy()
+
+
+def test_x6_x11_settings_saved(gui_app):
+    snap = gui_app._settings_snapshot()
+    assert snap["dark_title_bar"] is True and snap["check_updates"] is False
+    assert snap["last_update_check"] == "" and snap["skipped_version"] == ""
+
+
+def test_x9_sample_box_fits_its_text(gui_app):
+    from tkinter import font as tkfont
+    f = tkfont.Font(root=gui_app, font=st.FONTS["tiny"])
+    chars = int(gui_app._sample_where.cget("width"))
+    assert chars * f.measure("0") >= f.measure("from the middle") + 20
+
+
+def test_x8_detail_strip_font(gui_app):
+    assert "Consolas" not in str(gui_app._detail_meta.cget("font"))
+
+
+def test_help_mentions_v091():
+    for text in ("NEW IN v0.9.1", "About", "Check for updates", "Dark title bar", "Translation failed",
+                 "Running from source", "Help ▾", "F1", "Open folder", "Reddit"):
+        assert text.lower() in st.HELP_TEXT.lower(), text

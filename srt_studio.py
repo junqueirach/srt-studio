@@ -1,13 +1,29 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════╗
-║          SRT Studio  v0.9.0 — Desktop GUI                 ║
+║          SRT Studio  v0.9.1 — Desktop GUI                 ║
 ║     (formerly SRT Subtitle Translator, renamed in 0.9.0)  ║
 ║  Subtitle translation and repair, structure preserved:    ║
 ║  SRT · ASS/SSA · WebVTT · MicroDVD · SAMI · TTML          ║
 ║  Engines: Claude API · MyMemory (free)                    ║
 ║  Author:  Luiz Junqueira & Claude AI                      ║
 ╚═══════════════════════════════════════════════════════════╝
+
+v0.9.1 changes (fixes and polish):
+  • A run that fails (e.g. the API key is rejected) saves no file and adds no
+    AI notice; a "Translation failed" message says why and what to do.
+    Partial failures count only blocks that really changed as translated
+  • MyMemory notice fully in the target language: "… por IA (MyMemory)"
+  • "Install dependencies" question with the app icon, in front
+  • Title-bar icon without the dark square (transparent small icon)
+  • About window (author, contact, GitHub, licence) and a Help ▾ menu
+  • Dark title bar (Settings → General, on by default)
+  • Subtitles table: Source uses the width until translations arrive
+  • Detail strip in the normal font; "from the middle" box not clipped
+  • Settings → General: price file status, short path, Open folder
+  • Check for updates (Help menu, About; optional daily check at start)
+  • Fixed: the double-arrow cursor of the divider stayed on over the
+    whole window after the mouse crossed the divider
 
 v0.9.0 changes:
   • Renamed to SRT Studio; settings imported once from the old file
@@ -97,10 +113,25 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 # VERSION
 # ═══════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v0.9.0"
+APP_VERSION = "v0.9.1"
 APP_NAME    = "SRT Studio"          # formerly "SRT Subtitle Translator" (renamed in v0.9.0)
 APP_TITLE   = f"{APP_NAME}  {APP_VERSION}"
 APP_ID      = "SRTStudio.App"       # Windows taskbar identity (icon grouping)
+APP_AUTHORS  = "Luiz Junqueira & Claude AI"
+APP_CONTACT  = "junqueira.ch@gmail.com"
+APP_REPO_URL = "https://github.com/junqueirach/srt-studio"
+APP_REDDIT   = "https://www.reddit.com/r/SRTStudio/"
+APP_LICENCE  = "MIT"
+APP_TAGLINE  = "Translate and repair subtitle files while keeping every timing and line break intact."
+APP_FEATURES = [   # About window (X5); keep in line with the README "What it does"
+    "Opens SRT, ASS/SSA, WebVTT, MicroDVD, SAMI, TTML and MPL2",
+    "Translates into 32 languages with Claude (your own API key) or MyMemory (free)",
+    "Keeps timings, line counts and ASS styles, and reads the saved file back to verify it",
+    "Finds and repairs timing, numbering and ad/credit-line problems",
+    "Shows the estimated cost before a run and the real cost after",
+    "Keeps character names and hearing-impaired cues; can use a context file (same film in another language)",
+    "Adds a short \"translated by AI\" notice in the target language",
+]
 IS_FROZEN   = bool(getattr(sys, "frozen", False))
 APP_DIR     = Path(sys.executable).parent if IS_FROZEN else Path(__file__).resolve().parent
 
@@ -1273,7 +1304,7 @@ def fetch_official_prices(timeout: int = 15) -> dict:
     """Download and parse the official pricing page. {} on any failure."""
     try:
         r = _requests().get(PRICING_URL, timeout=timeout,
-                            headers={"User-Agent": f"srt-translator/{APP_VERSION}"})
+                            headers={"User-Agent": f"SRT-Studio/{APP_VERSION}"})
         if r.ok:
             return parse_pricing_markdown(r.text)
     except Exception:
@@ -1543,14 +1574,119 @@ def finish_summary(result: dict) -> tuple:
     flags = f"{n_flag} block(s) flagged" if n_flag else "no blocks flagged"
     if result.get("cancelled"):
         return None, (f"Cancelled — cost so far {cost}" if paid else "Cancelled")
+    if result.get("failed"):                                            # v0.9.1 (X1): nothing was saved
+        return "failed", f"Failed — {result.get('fail_short') or 'see the Log'}" + (f" · cost {cost}" if paid else "")
     if result.get("save_error"):
         return "save_failed", f"Not saved — {result['save_error']}"
     if not result.get("ok"):
         return None, "Completed with errors — check the Activity Log" + (f" · cost {cost}" if paid else "")
+    kept = result.get("kept") or []
     if result.get("sample"):
-        return None, f"Sample done — {result.get('total', 0)} blocks · {flags} · cost {cost}"
+        return None, (f"Sample done — {result.get('translated', result.get('total', 0))} of "
+                      f"{result.get('total', 0)} blocks translated · {flags} · cost {cost}")
     name = Path(result.get("saved_path") or "").name
+    if kept:
+        return "finished", (f"Done with problems — saved {name} · {len(kept)} block(s) kept in the source "
+                            f"language · cost {cost}")
     return "finished", f"Done — saved {name} · {flags} · cost {cost}"
+
+
+class FreeLimitReached(RuntimeError):
+    """MyMemory answered that the free daily volume is used up (v0.9.1)."""
+
+
+def failure_info(e: Exception, engine: str = "claude") -> dict:
+    """v0.9.1 (X1): a failed batch in plain words.
+    {kind, reason, short, advice}; kind = key | model | request | refused | limit | network | server | other."""
+    service = "api.anthropic.com" if engine == "claude" else "the MyMemory service (api.mymemory.translated.net)"
+    status = getattr(e, "status_code", None)
+    name = type(e).__name__
+    if isinstance(e, BatchRefused):
+        return {"kind": "refused", "reason": "Claude refused to translate this text.",
+                "short": "Claude refused the text", "advice": "Try another model, or translate the file in parts."}
+    if isinstance(e, FreeLimitReached):
+        return {"kind": "limit", "reason": "MyMemory's free daily limit is used up.",
+                "short": "MyMemory daily limit reached", "advice": "Try again tomorrow, or use Claude."}
+    if status == 401:
+        return {"kind": "key", "reason": "The API key was rejected (HTTP 401).", "short": "API key rejected",
+                "advice": "Check the key in ⚙ Settings → General (Edit), or create a new one at "
+                          "console.anthropic.com."}
+    if status == 403:
+        return {"kind": "key", "reason": "The API key is not allowed to do this (HTTP 403).",
+                "short": "API key not allowed",
+                "advice": "Check the key and its workspace permissions in ⚙ Settings, or pick another model."}
+    if status == 404:
+        return {"kind": "model", "reason": "The model was not found (HTTP 404).", "short": "model not found",
+                "advice": "Pick another model, or press ↻ next to the model list to refresh it."}
+    if status in (400, 413, 422):
+        return {"kind": "request", "reason": f"The API did not accept the request ({_err(e)}).",
+                "short": f"request refused (HTTP {status})",
+                "advice": "Try a smaller batch size (OPTIONS › Edit…) or another model."}
+    if "Connection" in name or "Timeout" in name or (isinstance(e, OSError) and not status):
+        return {"kind": "network", "reason": f"Could not reach {service}.", "short": "no connection",
+                "advice": "Check the internet connection and try again."}
+    if status == 429 or (status and status >= 500):
+        return {"kind": "server", "reason": f"The service is busy or not answering ({_err(e)}).",
+                "short": f"service error (HTTP {status})", "advice": "Wait a minute and try again."}
+    return {"kind": "other", "reason": _err(e) or name, "short": "error", "advice": "See the Log tab for details."}
+
+
+def nothing_translated_info(engine: str) -> dict:
+    """v0.9.1 (X1): every block came back unchanged without an error (e.g. MyMemory with the same language)."""
+    return {"kind": "unchanged", "reason": "Nothing was translated: every block came back unchanged.",
+            "short": "nothing translated",
+            "advice": "Check the source and target languages" + (", or try Claude." if engine != "claude" else ".")}
+
+
+# ── v0.9.1 (X11): check for updates ──────────────────────────────────
+
+RELEASES_API = "https://api.github.com/repos/junqueirach/srt-studio/releases/latest"
+
+
+def parse_version(tag) -> tuple:
+    """'v0.10.0' / '0.9.1' → (0, 10, 0) / (0, 9, 1); anything else → ()."""
+    m = re.match(r"^\s*v?(\d+(?:\.\d+){1,3})\s*$", str(tag or ""))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def is_newer(tag, current: str = APP_VERSION) -> bool:
+    a, b = parse_version(tag), parse_version(current)
+    return bool(a and b and a > b)
+
+
+def check_latest_release(get=None, timeout: float = 5) -> dict:
+    """Ask GitHub for the latest published release (no login; nothing else is sent).
+    {'status': 'newer' | 'latest' | 'none' | 'error', 'version', 'url', 'error'}. Never raises."""
+    try:
+        if get is None:
+            get = _requests().get
+        r = get(RELEASES_API, timeout=timeout,
+                headers={"User-Agent": f"SRT-Studio/{APP_VERSION}", "Accept": "application/vnd.github+json"})
+        if getattr(r, "status_code", 200) == 404:
+            return {"status": "none", "version": "", "url": APP_REPO_URL + "/releases", "error": ""}
+        if getattr(r, "status_code", 200) != 200:
+            return {"status": "error", "version": "", "url": "", "error": f"HTTP {r.status_code}"}
+        data = r.json()
+        tag, url = data.get("tag_name", ""), data.get("html_url") or APP_REPO_URL + "/releases"
+        if not parse_version(tag):
+            return {"status": "error", "version": "", "url": "", "error": f"unexpected version tag {tag!r}"}
+        ver = ".".join(map(str, parse_version(tag)))
+        return {"status": "newer" if is_newer(tag) else "latest", "version": ver, "url": url, "error": ""}
+    except Exception as e:
+        return {"status": "error", "version": "", "url": "", "error": _err(e) or type(e).__name__}
+
+
+# ── v0.9.1 (X7): Subtitles table column widths ───────────────────────
+
+def table_column_widths(free_px: int, translated: bool, narrow_px: int) -> tuple:
+    """(source, translation) widths for the free width of the table. Before any translation the Translation
+    column is narrow (its heading) and Source gets the rest; once translations arrive they share it."""
+    free_px = max(0, int(free_px))
+    if translated:
+        half = free_px // 2
+        return free_px - half, half
+    dst = min(narrow_px, free_px // 2)
+    return free_px - dst, dst
 
 
 def estimate_cost(blocks: list, model_id: str, catalog: Catalog, *, api_key: str = "",
@@ -1894,19 +2030,28 @@ def translate_free(text_lines: list, source_lang: str, target_lang: str,
     src = _MM_LANG.get(source_lang, source_lang.split("-")[0].lower()[:2])
     tgt = _MM_LANG.get(target_lang, target_lang.split("-")[0].lower()[:2])
     results = []
+    asked, failed, last_error = 0, 0, None
     for line in text_lines:
         if is_passthrough(line, translate_cues):
             results.append(line)
             continue
         core, tags = protect_tags(line)
+        asked += 1
         try:
             url = (f"https://api.mymemory.translated.net/get"
                    f"?q={requests.utils.quote(core)}&langpair={src}|{tgt}")
             data = requests.get(url, timeout=10).json()
-            out = data["responseData"]["translatedText"] if data.get("responseStatus") == 200 else core
-        except Exception:
-            out = core
+            text = str((data.get("responseData") or {}).get("translatedText") or "")
+            if str(data.get("responseStatus")) == "429" or "MYMEMORY WARNING" in text.upper():
+                raise FreeLimitReached(text or "daily limit reached")     # v0.9.1: stop, do not save the warning
+            out = text if str(data.get("responseStatus")) == "200" and text else core
+        except FreeLimitReached:
+            raise
+        except Exception as e:
+            failed, last_error, out = failed + 1, e, core
         results.append(restore_tags(out, tags))
+    if asked and failed == asked:         # v0.9.1 (X1): not one line answered → the batch failed (retried, then reported)
+        raise last_error
     return results
 
 
@@ -2021,7 +2166,8 @@ timings and line counts are kept, ASS styles and positions too.
 THE WINDOW
 ----------
 Toolbar        Open… (Ctrl+O), Recent ▾ (the last 8 files), Settings,
-               Help.
+               Help ▾ (Help, Translation engines, Check for updates…,
+               About). Click the logo or the name for About.
 Left side      The job: SOURCE (file, format, encoding, blocks,
                language, Repair status, Context file), LANGUAGES,
                ENGINE (provider and model), OPTIONS (summary and
@@ -2036,7 +2182,43 @@ Divider        Drag the divider between the two sides to make either
 Status bar     What is happening, the progress bar, the last cost and
                an "Open folder" link after a saved run.
 Keyboard       Ctrl+O open · Ctrl+Enter start · Esc cancel a run ·
-               Ctrl+1/2/3 tabs · Ctrl+S save the log (Log tab).
+               Ctrl+1/2/3 tabs · Ctrl+S save the log (Log tab) ·
+               F1 this Help.
+
+NEW IN v0.9.1
+-------------
+Failed runs    If a run cannot work (the API key is rejected, the
+               model does not exist, no internet connection, the
+               MyMemory daily limit is used up) it stops at once. No
+               file is written and no AI notice is added. A
+               "Translation failed" message says what happened and
+               what to do (Open Settings for a key problem; Show log).
+               If only some batches fail, the file is saved and the
+               message counts only the blocks that really changed as
+               translated; the others are named as "kept in the
+               source language" and marked ⚑.
+MyMemory       The AI notice is fully in the target language, e.g.
+notice         "Legendas traduzidas por IA (MyMemory)".
+About          Help ▾ › About SRT Studio (or click the logo): author,
+               contact email, GitHub page, Reddit (r/SRTStudio),
+               licence and what the app does. The email, GitHub and
+               Reddit links can be clicked; without a mail program
+               the address is copied to the clipboard. "Copy" copies
+               the version details for a bug report.
+Check for      Help ▾ › Check for updates… asks GitHub for the latest
+updates        release (nothing else is sent, nothing is downloaded).
+               Settings → General → UPDATES can do it at start, at
+               most once a day (off by default); a newer version then
+               shows a link in the status bar.
+Title bar      The window's title bar icon has no dark square, and
+               the title bar is dark like the app (Settings → General
+               → Dark title bar; Windows 10 and 11).
+Subtitles      Before a run the Source column uses the width; when
+table          translations arrive Source and Translation share it.
+               Drag a column edge to set the widths yourself (kept
+               until you open another file).
+Fixed          The double-arrow cursor of the divider no longer stays
+               on over the whole window.
 
 NEW IN v0.9.0
 -------------
@@ -2151,7 +2333,11 @@ SETTINGS (⚙)
 ------------
 General   Claude API key (stored only on this computer, sent only to
           api.anthropic.com), models and prices with Refresh now,
-          Reset layout.
+          the price override file (pricing.json next to the app:
+          found / not present, Open folder, Copy path; copy
+          pricing.example.json to pricing.json to use one), Reset
+          layout, Dark title bar, and UPDATES (Check for updates at
+          start, Check now).
 Output    Show a message when a translation finishes; Output format
           (same as the source / always SRT); Encoding; AI notice
           (on/off, text, seconds).
@@ -2170,6 +2356,19 @@ TRANSLATION ENGINES
 Claude (recommended): needs an API key from console.anthropic.com.
 Understands tone, humour, slang and context.
 MyMemory (free): no key, literal, limited daily volume.
+
+RUNNING FROM SOURCE
+-------------------
+Started as a Python script (SRT Studio.bat), the app checks its
+packages first. If one is missing, an "Install dependencies"
+question with the app's name and icon appears in front of the other
+windows. The Windows exe has everything built in and never asks.
+
+ABOUT
+-----
+{APP_NAME} by {APP_AUTHORS}. Licence {APP_LICENCE}.
+Contact {APP_CONTACT} · GitHub {APP_REPO_URL.replace("https://", "")}
+· Reddit r/SRTStudio. Help ▾ › About shows the links.
 """
 
 
@@ -2367,6 +2566,102 @@ def asset_path(name: str) -> Path:
     return base / "assets" / name
 
 
+# ── v0.9.1: Windows title bar (X4 icon, X6 dark) — every call is optional and never raises ──
+
+_HICONS = {}       # (path, size) → icon handle, kept for the life of the app
+
+
+def _win_frame(win) -> int:
+    """The Windows frame (title bar owner) of a Tk toplevel, or 0."""
+    try:
+        return int(win.wm_frame(), 16)
+    except Exception:
+        return 0
+
+
+def _colorref(hex_colour: str) -> int:
+    """'#1a2331' → 0x0031231a (Windows COLORREF is 0x00BBGGRR)."""
+    h = hex_colour.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b << 16) | (g << 8) | r
+
+
+def set_window_icons(win) -> bool:
+    """Title bar: the transparent small icon (ICON_SMALL); taskbar / Alt+Tab: the tile (ICON_BIG)."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        small, big = asset_path("icon-small.ico"), asset_path("icon.ico")
+        hwnd = _win_frame(win)
+        if not hwnd or not small.exists() or not big.exists():
+            return False
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT, ctypes.c_int,
+                                      ctypes.c_int, wintypes.UINT]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+
+        def load(path, size):
+            key = (str(path), size)
+            if key not in _HICONS:
+                _HICONS[key] = user32.LoadImageW(None, str(path), 1, size, size, 0x10)   # IMAGE_ICON, LR_LOADFROMFILE
+            return _HICONS[key]
+        hs = load(small, user32.GetSystemMetrics(49))        # SM_CXSMICON: 16 / 20 / 24 / 32 px with the scaling
+        hb = load(big, user32.GetSystemMetrics(11))          # SM_CXICON
+        if not hs or not hb:
+            return False
+        user32.SendMessageW(hwnd, 0x0080, 0, hs)             # WM_SETICON, ICON_SMALL
+        user32.SendMessageW(hwnd, 0x0080, 1, hb)             # WM_SETICON, ICON_BIG
+        return True
+    except Exception:
+        return False
+
+
+def set_dark_title_bar(win, on: bool = True) -> bool:
+    """Windows 10 1809+ / 11: dark title bar; on Windows 11 it takes the toolbar colour. Older Windows: no change."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        hwnd = _win_frame(win)
+        if not hwnd:
+            return False
+        dwm = ctypes.windll.dwmapi
+        val = ctypes.c_int(1 if on else 0)
+        ok = dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(val), 4) == 0          # DWMWA_USE_IMMERSIVE_DARK_MODE
+        if not ok:
+            ok = dwm.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(val), 4) == 0      # Windows 10 1809–1909
+        if sys.getwindowsversion().build >= 22000:
+            default = 0xFFFFFFFF                                                     # DWMWA_COLOR_DEFAULT
+            cap = ctypes.c_uint(_colorref(COLORS["bg_card"]) if on else default)
+            txt = ctypes.c_uint(_colorref(COLORS["text"]) if on else default)
+            dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(cap), 4)               # DWMWA_CAPTION_COLOR
+            dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(txt), 4)               # DWMWA_TEXT_COLOR
+        # repaint the frame now (SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED)
+        ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+        return ok
+    except Exception:
+        return False
+
+
+def app_version_info(tk_patchlevel: str = "") -> str:
+    """One line for bug reports (About → Copy). Nothing is sent anywhere."""
+    if os.name == "nt":
+        try:
+            osname = f"Windows (build {sys.getwindowsversion().build})"
+        except Exception:
+            osname = "Windows"
+    else:
+        osname = sys.platform
+    return " · ".join(p for p in (f"{APP_NAME} {APP_VERSION.lstrip('v')}",
+                                  "Windows exe" if IS_FROZEN else "running from source", osname,
+                                  f"Python {sys.version.split()[0]}",
+                                  f"Tk {tk_patchlevel}" if tk_patchlevel else "") if p)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -2428,6 +2723,11 @@ class App(tk.Tk):
         self.remove_ads     = tk.BooleanVar(value=cfg.get("remove_ads", True))
         self._ad_extra      = list(cfg.get("ad_patterns_extra") or [])
         self.sample_from    = tk.StringVar(value=cfg.get("sample_from", "middle"))
+        self.dark_title     = tk.BooleanVar(value=cfg.get("dark_title_bar", True))          # v0.9.1 (X6)
+        self.check_updates  = tk.BooleanVar(value=cfg.get("check_updates", False))          # v0.9.1 (X11)
+        self._last_update_check = cfg.get("last_update_check", "")
+        self._skipped_version   = cfg.get("skipped_version", "")
+        self._cols_user     = False      # v0.9.1 (X7): the user dragged a column edge for this file
         self.progress_var   = tk.DoubleVar(value=0)
         self.status_text    = tk.StringVar(value="Open a subtitle to begin  (Ctrl+O, or drop a file on the window)")
         self._catalog_status = tk.StringVar(value="")
@@ -2461,6 +2761,7 @@ class App(tk.Tk):
         self._update_names_count()
         self._show_empty_state()
         self._bind_keys()
+        self._decorate(self)
         self.after(300, self._startup_refresh)
 
     # ── scaling helpers ──────────────────────────────────────────────
@@ -2490,6 +2791,21 @@ class App(tk.Tk):
                     self._icons[s] = tk.PhotoImage(file=str(p))
         except Exception:
             pass
+
+    def _decorate(self, win):
+        """v0.9.1: title-bar icon (X4) and dark title bar (X6) for the main window and every app dialog."""
+        try:
+            win.update_idletasks()
+        except tk.TclError:
+            return
+        set_window_icons(win)
+        if self.dark_title.get():
+            set_dark_title_bar(win, True)
+
+    def _apply_dark_title(self):
+        on = self.dark_title.get()
+        for w in [self] + [c for c in self.winfo_children() if isinstance(c, tk.Toplevel)]:
+            set_dark_title_bar(w, on)
 
     # ── Cross-thread UI updates ──────────────────────────────────────
 
@@ -2543,6 +2859,10 @@ class App(tk.Tk):
             "remove_ads":        self.remove_ads.get(),
             "ad_patterns_extra": self._ad_extra,
             "sample_from":       self.sample_from.get(),
+            "dark_title_bar":    self.dark_title.get(),
+            "check_updates":     self.check_updates.get(),
+            "last_update_check": self._last_update_check,
+            "skipped_version":   self._skipped_version,
             "recent_files":      self._recent,
             "window":            {"geometry": self.winfo_geometry(), "left_ratio": self._left_ratio,
                                   "tab": self._current_tab_name()},
@@ -2569,6 +2889,8 @@ class App(tk.Tk):
             self._log(f"Price override file: {PRICING_OVERRIDE_PATH}", "info")
         if self.catalog.prices_stale() or (self.catalog.models_stale() and self._api_key.strip()):
             self._refresh_catalog(force=False)
+        if self.check_updates.get() and self._last_update_check != datetime.now().strftime("%Y-%m-%d"):
+            self._check_for_updates(manual=False)
 
     # ── Styles & small widget helpers ────────────────────────────────
 
@@ -2644,8 +2966,10 @@ class App(tk.Tk):
         self._paned = tk.PanedWindow(self, orient="horizontal", bg=COLORS["border"], sashwidth=self.px(6),
                                      sashrelief="flat", bd=0, opaqueresize=True, sashcursor="sb_h_double_arrow")
         self._paned.grid(row=1, column=0, sticky="nsew")
-        left = tk.Frame(self._paned, bg=COLORS["bg_card"])
-        right = tk.Frame(self._paned, bg=COLORS["bg_dark"])
+        # v0.9.1 (X12): both sides have their own arrow cursor. Without it they inherit the divider's double arrow,
+        # which Tk leaves set when the mouse leaves the divider quickly into a side.
+        left = tk.Frame(self._paned, bg=COLORS["bg_card"], cursor="arrow")
+        right = tk.Frame(self._paned, bg=COLORS["bg_dark"], cursor="arrow")
         self._paned.add(left, minsize=self.px(LEFT_MIN_PX), stretch="always")
         self._paned.add(right, minsize=self.px(RIGHT_MIN_PX), stretch="always")
         self._left_frame, self._right_frame = left, right
@@ -2670,11 +2994,20 @@ class App(tk.Tk):
         tk.Frame(self, bg=C["border"], height=1).grid(row=0, column=0, sticky="sew")
         brand = tk.Frame(bar, bg=C["bg_card"])
         brand.pack(side="left", padx=(self.px(12), self.px(18)))
+        brand_parts = []
         if 20 in self._icons:
-            tk.Label(brand, image=self._icons[20], bg=C["bg_card"]).pack(side="left", padx=(0, 8))
-        tk.Label(brand, text=APP_NAME, font=FONTS["heading"], fg=C["text_bright"], bg=C["bg_card"]).pack(side="left")
-        tk.Label(brand, text=APP_VERSION.lstrip("v"), font=FONTS["tiny"], fg=C["text_dim"],
-                 bg=C["bg_card"]).pack(side="left", padx=(6, 0), pady=(4, 0))
+            brand_parts.append(tk.Label(brand, image=self._icons[20], bg=C["bg_card"]))
+            brand_parts[-1].pack(side="left", padx=(0, 8))
+        brand_parts.append(tk.Label(brand, text=APP_NAME, font=FONTS["heading"], fg=C["text_bright"],
+                                    bg=C["bg_card"]))
+        brand_parts[-1].pack(side="left")
+        brand_parts.append(tk.Label(brand, text=APP_VERSION.lstrip("v"), font=FONTS["tiny"], fg=C["text_dim"],
+                                    bg=C["bg_card"]))
+        brand_parts[-1].pack(side="left", padx=(6, 0), pady=(4, 0))
+        for w in brand_parts:                                    # v0.9.1 (X5): the logo opens About
+            w.configure(cursor="hand2")
+            w.bind("<Button-1>", lambda e: self._show_about())
+        Tooltip(brand_parts[-2], f"About {APP_NAME}")
         b = self._flat_btn(bar, "Open…", self._browse, padx=12, pady=3, bg=C["bg_card"])
         b.configure(highlightbackground=C["border"], highlightthickness=1)
         b.pack(side="left", pady=self.px(8))
@@ -2687,7 +3020,20 @@ class App(tk.Tk):
                                     postcommand=self._fill_recent_menu)
         self._recent_btn.configure(menu=self._recent_menu)
         self._recent_btn.pack(side="left", padx=(6, 0))
-        self._flat_btn(bar, "?  Help", self._show_help, bg=C["bg_card"], padx=12, pady=3).pack(side="right", padx=(4, 12))
+        # v0.9.1 (X5): Help ▾ menu (Help, engines, updates, About), like Recent ▾
+        help_btn = tk.Menubutton(bar, text="?  Help ▾", font=FONTS["small"], bg=C["bg_card"], fg=C["text"],
+                                 activebackground=C["border"], activeforeground=C["text_bright"],
+                                 relief="flat", cursor="hand2", padx=12, pady=3, bd=0)
+        hm = tk.Menu(help_btn, tearoff=False, bg=C["bg_input"], fg=C["text"], activebackground=C["select"],
+                     activeforeground=C["text_bright"])
+        hm.add_command(label="Help", accelerator="F1", command=self._show_help)
+        hm.add_command(label="Translation engines", command=self._show_engine_help)
+        hm.add_command(label="Check for updates…", command=lambda: self._check_for_updates(manual=True))
+        hm.add_separator()
+        hm.add_command(label=f"About {APP_NAME}", command=self._show_about)
+        help_btn.configure(menu=hm)
+        help_btn.pack(side="right", padx=(4, 12))
+        self._help_menu = hm
         s = self._flat_btn(bar, "⚙  Settings", self._show_settings, bg=C["bg_card"], padx=12, pady=3)
         s.pack(side="right")
         Tooltip(s, "API key, prices, output format and encoding, AI notice, repair rules")
@@ -2884,7 +3230,9 @@ class App(tk.Tk):
         self.sample_btn = self._flat_btn(row, f"◐  Sample ({SAMPLE_BLOCKS})", lambda: self._start(sample=True), pady=5)
         self.sample_btn.grid(row=0, column=0, sticky="ew")
         self._sample_where = ttk.Combobox(row, values=["from the middle", "from the start"], state="readonly",
-                                          width=14, style="Lang.TCombobox", font=FONTS["tiny"])
+                                          width=self._combo_chars(["from the middle", "from the start"],
+                                                                  FONTS["tiny"]),
+                                          style="Lang.TCombobox", font=FONTS["tiny"])
         self._sample_where.current(0 if self.sample_from.get() == "middle" else 1)
         self._sample_where.bind("<<ComboboxSelected>>", lambda e: self.sample_from.set(
             "middle" if self._sample_where.current() == 0 else "start"))
@@ -2896,6 +3244,17 @@ class App(tk.Tk):
         self.cancel_btn = self._flat_btn(row, "✕  Cancel", self._cancel, pady=5)
         self.cancel_btn.grid(row=0, column=2, sticky="ew")
         self._set_cancel_state(False)
+
+    def _combo_chars(self, values, font) -> int:
+        """v0.9.1 (X9): a Combobox width (in average characters) that shows the longest value in full,
+        measured in its font, plus room for the arrow and the padding."""
+        try:
+            from tkinter import font as tkfont
+            f = tkfont.Font(root=self, font=font)
+            need = max(f.measure(v) for v in values) + self.px(30)      # arrow + padding (6 px each side)
+            return max(8, -(-need // max(1, f.measure("0"))))
+        except Exception:
+            return 18
 
     def _set_cancel_state(self, active: bool):
         C = COLORS
@@ -2976,8 +3335,8 @@ class App(tk.Tk):
         detail.pack(side="bottom", fill="x")
         detail.pack_propagate(False)
         tk.Frame(detail, bg=C["border"], height=1).pack(fill="x")
-        self._detail_meta = tk.Label(detail, text="", font=FONTS["mono_sm"], fg=C["text_dim"], bg=C["detail_bg"],
-                                     anchor="w")
+        self._detail_meta = tk.Label(detail, text="", font=FONTS["tiny"], fg=C["text_dim"], bg=C["detail_bg"],
+                                     anchor="w")          # v0.9.1 (X8): the app font, not Consolas
         self._detail_meta.pack(fill="x", padx=self.px(14), pady=(6, 2))
         self._detail_text = tk.Text(detail, font=FONTS["small"], bg=C["detail_bg"], fg=C["text"], relief="flat",
                                     wrap="word", height=4, highlightthickness=0, padx=self.px(12), pady=0)
@@ -3006,7 +3365,29 @@ class App(tk.Tk):
         self.tree.tag_configure("repaired", foreground=C["accent_soft"])
         self.tree.tag_configure("notr", foreground=C["text"])
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_detail())
+        self.tree.bind("<Configure>", lambda e: self._layout_columns(), add="+")
+        self.tree.bind("<ButtonPress-1>", self._on_tree_press, add="+")
         self._update_filter_buttons()
+
+    # v0.9.1 (X7): Source uses the width until translations arrive, then Source and Translation share it
+    def _on_tree_press(self, event):
+        try:
+            if self.tree.identify_region(event.x, event.y) == "separator":
+                self._cols_user = True           # the user resizes a column: keep their widths for this file
+        except tk.TclError:
+            pass
+
+    def _layout_columns(self):
+        if self._cols_user or not hasattr(self, "tree"):
+            return
+        width = self.tree.winfo_width()
+        if width <= 1:
+            return
+        fixed = sum(int(self.tree.column(c, "width")) for c in ("num", "time", "flag"))
+        src, dst = table_column_widths(width - fixed - 2, bool(self._tr_lines), self.px(170))
+        if (int(self.tree.column("src", "width")), int(self.tree.column("dst", "width"))) != (src, dst):
+            self.tree.column("src", width=src)
+            self.tree.column("dst", width=dst)
 
     def _update_table_headings(self):
         if not hasattr(self, "tree"):
@@ -3088,6 +3469,7 @@ class App(tk.Tk):
         if sel and self.tree.exists(sel[0]):
             self.tree.selection_set(sel[0])
             self.tree.see(sel[0])
+        self._layout_columns()
         self._show_detail()
 
     def _show_detail(self):
@@ -3283,6 +3665,10 @@ class App(tk.Tk):
         self._last_cost_lbl.pack(side="right")
         self._open_link = self._link(bar, "Open folder", lambda: self._open_folder(self._last_saved), bg=C["bg_mid"])
         Tooltip(self._open_link, "Show the translated file in Explorer")
+        self._update_url = ""                                    # v0.9.1 (X11): shown only when a newer release exists
+        self._update_link = self._link(bar, "", lambda: self._open_url(self._update_url), bg=C["bg_mid"])
+        self._update_link.configure(fg=C["success"])
+        Tooltip(self._update_link, "Open the download page of the new version on GitHub")
         self.pct_label = tk.Label(bar, text="", font=FONTS["mono_sm"], fg=C["text_dim"], bg=C["bg_mid"], width=5)
         self.pct_label.pack(side="right")
         self._pbar = ttk.Progressbar(bar, variable=self.progress_var, maximum=100, length=self.px(240),
@@ -3305,6 +3691,11 @@ class App(tk.Tk):
             self._open_link.pack(side="right", padx=(0, 6), before=self._last_cost_lbl)
         else:
             self._open_link.pack_forget()
+
+    def _show_update_link(self, version: str, url: str):
+        self._update_url = url
+        self._update_link.configure(text=f"⬆ Update available: v{version}")
+        self._update_link.pack(side="right", padx=(0, 10), before=self._last_cost_lbl)
 
     # ── Divider (G1 11b) ─────────────────────────────────────────────
 
@@ -3365,6 +3756,7 @@ class App(tk.Tk):
         for i in range(3):
             self.bind_all(f"<Control-Key-{i + 1}>", lambda e, k=i: self.notebook.select(k))
         self.bind_all("<Control-s>", lambda e: self._save_log() if self._current_tab_name() == "log" else None)
+        self.bind_all("<F1>", lambda e: self._show_help())
 
     # ── Engine / model / catalog ─────────────────────────────────────
 
@@ -3515,6 +3907,14 @@ class App(tk.Tk):
         dlg.geometry(f"{w}x{h}+{self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)}"
                      f"+{self.winfo_rooty() + max(0, (self.winfo_height() - h) // 2)}")
         dlg.bind("<Escape>", lambda e: dlg.destroy())
+        self._decorate(dlg)
+        mapped = []
+
+        def on_map(e):                   # the Windows frame exists only once the dialog is shown: decorate it again
+            if e.widget is dlg and not mapped:
+                mapped.append(1)
+                dlg.after(10, lambda: dlg.winfo_exists() and self._decorate(dlg))
+        dlg.bind("<Map>", on_map, add="+")
         return dlg
 
     def _section(self, parent, text, top=16):
@@ -3590,8 +3990,8 @@ class App(tk.Tk):
             self._settings_dlg.lift()
             return
         C = COLORS
-        dlg = self._dialog("Settings", 620, 500)
-        dlg.minsize(self.px(560), self.px(440))
+        dlg = self._dialog("Settings", 640, 580)
+        dlg.minsize(self.px(580), self.px(520))
         self._settings_dlg = dlg
         nb = ttk.Notebook(dlg, style="T.TNotebook")
         nb.pack(fill="both", expand=True, padx=0, pady=(6, 0))
@@ -3622,12 +4022,39 @@ class App(tk.Tk):
                  anchor="w", justify="left").pack(side="left", fill="x", expand=True)
         self._flat_btn(row2, "↻  Refresh now", lambda: self._refresh_catalog(force=True), font=FONTS["tiny"],
                        pady=4).pack(side="right")
-        tk.Label(p, text=f"Price override file (optional): {PRICING_OVERRIDE_PATH}", font=FONTS["tiny"],
-                 fg=C["text_dim"], bg=C["bg_card"], anchor="w", wraplength=self.px(560),
-                 justify="left").pack(fill="x", padx=20, pady=(6, 0))
+        # v0.9.1 (X10): status, the path on one line (full path in the tooltip), Open folder / Copy path
+        pf = PRICING_OVERRIDE_PATH
+        n_over = len(self.catalog.override)
+        pstate = (f"found, {n_over} model(s)" if n_over else "found but not readable (see the Help)"
+                  if pf.exists() else "not present")
+        tk.Label(p, text=f"Price override file (optional): {pstate}", font=FONTS["tiny"],
+                 fg=C["text"] if n_over else C["text_dim"], bg=C["bg_card"],
+                 anchor="w").pack(fill="x", padx=20, pady=(6, 0))
+        prow = tk.Frame(p, bg=C["bg_card"])
+        prow.pack(fill="x", padx=20)
+        plabel = tk.Label(prow, text=middle_ellipsis(str(pf), 62), font=FONTS["tiny"], fg=C["text_dim"],
+                          bg=C["bg_card"], anchor="w")
+        plabel.pack(side="left")
+        Tooltip(plabel, str(pf))
+        self._link(prow, "Copy path", lambda: self._copy_text(str(pf), "Path copied")).pack(side="right")
+        self._link(prow, "Open folder", lambda: self._open_path_folder(pf)).pack(side="right", padx=(0, 12))
         self._section(p, "WINDOW")
         self._link(p, "Reset layout (divider back to the default position)", self.reset_layout,
                    font=FONTS["small"]).pack(anchor="w", padx=20)
+        self._check(p, "Dark title bar (matches the app; Windows 10 and 11)", self.dark_title,
+                    "Draws the window's title bar dark instead of light grey. Windows 11 uses the toolbar colour.",
+                    command=self._apply_dark_title)
+        self._section(p, "UPDATES")
+        urow = tk.Frame(p, bg=C["bg_card"])
+        urow.pack(fill="x")
+        c = tk.Checkbutton(urow, text="Check for updates at start (at most once a day)", variable=self.check_updates,
+                           font=FONTS["small"], fg=C["text"], bg=C["bg_card"], selectcolor=C["bg_input"],
+                           activebackground=C["bg_card"], activeforeground=C["text_bright"], anchor="w",
+                           cursor="hand2")
+        c.pack(side="left", padx=(16, 0))
+        Tooltip(c, "Asks GitHub for the latest release. Nothing else is sent. A newer version shows a link "
+                   "in the status bar; nothing is downloaded or installed.")
+        self._link(urow, "Check now", lambda: self._check_for_updates(manual=True)).pack(side="right", padx=20)
 
         # OUTPUT
         p = page("Output")
@@ -3767,6 +4194,252 @@ class App(tk.Tk):
     def _show_engine_help(self):
         self._show_text_dialog("Translation engines", ENGINE_HELP_TEXT, 640, 560)
 
+    # ── v0.9.1: links, About (X5), updates (X11) ─────────────────────
+
+    def _open_url(self, url: str) -> bool:
+        if not url:
+            return False
+        try:
+            return bool(webbrowser.open(url))
+        except Exception as e:
+            self._log(f"Could not open {url}: {e}", "warn")
+            return False
+
+    def _copy_text(self, text: str, note: str = "Copied") -> None:
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.status_text.set(f"{note}: {text}")
+        except tk.TclError:
+            pass
+
+    def _open_mail(self, address: str, note_label=None) -> bool:
+        """mailto: opens the mail program. Without one (common on Windows) the address is copied instead."""
+        try:
+            ok = bool(webbrowser.open(f"mailto:{address}"))
+        except Exception:
+            ok = False
+        if not ok:
+            self._copy_text(address, "Email address copied")
+            if note_label is not None:
+                note_label.configure(text=f"No mail program found — {address} was copied to the clipboard.")
+        return ok
+
+    def _open_path_folder(self, path: Path):
+        if Path(path).exists():
+            self._open_folder(str(path))
+            return
+        folder = Path(path).parent
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder))
+            else:
+                webbrowser.open(folder.as_uri())
+        except Exception as e:
+            self._log(f"Could not open the folder: {e}", "warn")
+
+    def _url_label(self, parent, text, action, bg, font=None, copy_text=""):
+        """A clickable link: accent colour, hand cursor, underlined on hover, right-click → Copy link."""
+        font = font or FONTS["small"]
+        lbl = tk.Label(parent, text=text, font=font, fg=COLORS["accent_soft"], bg=bg, cursor="hand2", anchor="w")
+        lbl.bind("<Button-1>", lambda e: action())
+        lbl.bind("<Enter>", lambda e: lbl.configure(font=font + ("underline",)))
+        lbl.bind("<Leave>", lambda e: lbl.configure(font=font))
+        if copy_text:
+            menu = tk.Menu(lbl, tearoff=False, bg=COLORS["bg_input"], fg=COLORS["text"],
+                           activebackground=COLORS["select"], activeforeground=COLORS["text_bright"])
+            menu.add_command(label="Copy link", command=lambda: self._copy_text(copy_text, "Copied"))
+            lbl.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
+        return lbl
+
+    def _rich_text(self, parent, parts, bg, fg):
+        """A read-only sentence that flows like normal text, with clickable words.
+        parts: [(text, action or None, text for "Copy link")]."""
+        t = tk.Text(parent, font=FONTS["small"], bg=bg, fg=fg, relief="flat", bd=0, highlightthickness=0,
+                    wrap="word", height=1, padx=0, pady=0, cursor="arrow")
+        link_font = FONTS["small"]
+        for k, (text, action, copy) in enumerate(parts):
+            if action is None:
+                t.insert("end", text)
+                continue
+            tag = f"link{k}"
+            t.insert("end", text, ("link", tag))
+            t.tag_bind(tag, "<Button-1>", lambda e, a=action: a())
+            t.tag_bind(tag, "<Enter>", lambda e, tg=tag: (t.configure(cursor="hand2"),
+                                                          t.tag_configure(tg, underline=True)))
+            t.tag_bind(tag, "<Leave>", lambda e, tg=tag: (t.configure(cursor="arrow"),
+                                                          t.tag_configure(tg, underline=False)))
+            if copy:
+                menu = tk.Menu(t, tearoff=False, bg=COLORS["bg_input"], fg=COLORS["text"],
+                               activebackground=COLORS["select"], activeforeground=COLORS["text_bright"])
+                menu.add_command(label="Copy link", command=lambda c=copy: self._copy_text(c, "Copied"))
+                t.tag_bind(tag, "<Button-3>", lambda e, m=menu: m.tk_popup(e.x_root, e.y_root))
+        t.tag_configure("link", foreground=COLORS["accent_soft"], font=link_font)
+        t.configure(state="disabled")
+
+        def fit(_e=None):            # as many lines as the wrapped text needs
+            try:
+                n = int(t.count("1.0", "end", "displaylines")[0])
+                if n != int(t.cget("height")):
+                    t.configure(height=max(1, n))
+            except (tk.TclError, TypeError):
+                pass
+        t.bind("<Configure>", fit)
+        return t
+
+    def _show_about(self):
+        dlg0 = getattr(self, "_about_dlg", None)
+        if dlg0 is not None and dlg0.winfo_exists():
+            dlg0.lift()
+            return
+        C = COLORS
+        bg = C["bg_card"]
+        dlg = self._dialog(f"About {APP_NAME}", 600, 660)
+        dlg.resizable(False, False)
+        self._about_dlg = dlg
+        body = tk.Frame(dlg, bg=bg)
+        body.pack(fill="both", expand=True, padx=26, pady=(20, 0))
+
+        head = tk.Frame(body, bg=bg)
+        head.pack(fill="x")
+        if 64 in self._icons:
+            tk.Label(head, image=self._icons[64], bg=bg).pack(side="left", padx=(0, 16))
+        names = tk.Frame(head, bg=bg)
+        names.pack(side="left")
+        tk.Label(names, text=APP_NAME, font=FONTS["title"], fg=C["text_bright"], bg=bg, anchor="w").pack(anchor="w")
+        tk.Label(names, text=f"Version {APP_VERSION.lstrip('v')}", font=FONTS["small"], fg=C["text_dim"], bg=bg,
+                 anchor="w").pack(anchor="w")
+
+        # labels and values in two columns, so they line up in any font
+        grid = tk.Frame(body, bg=bg)
+        grid.pack(fill="x", pady=(18, 0))
+        note = tk.Label(body, text="", font=FONTS["tiny"], fg=C["warning"], bg=bg, anchor="w")
+        repo_short = APP_REPO_URL.replace("https://", "")
+        rows = [("Created by", tk.Label(grid, text=APP_AUTHORS, font=FONTS["small"], fg=C["text"], bg=bg,
+                                        anchor="w")),
+                ("Contact", self._url_label(grid, APP_CONTACT, lambda: self._open_mail(APP_CONTACT, note), bg,
+                                            copy_text=APP_CONTACT)),
+                ("GitHub", self._url_label(grid, repo_short, lambda: self._open_url(APP_REPO_URL), bg,
+                                           copy_text=APP_REPO_URL)),
+                ("Reddit", self._url_label(grid, "r/SRTStudio", lambda: self._open_url(APP_REDDIT), bg,
+                                           copy_text=APP_REDDIT)),
+                ("Licence", tk.Label(grid, text=APP_LICENCE, font=FONTS["small"], fg=C["text"], bg=bg, anchor="w"))]
+        for r, (label, widget) in enumerate(rows):
+            tk.Label(grid, text=label, font=FONTS["small"], fg=C["text_dim"], bg=bg, anchor="w").grid(
+                row=r, column=0, sticky="w", padx=(0, 18), pady=1)
+            widget.grid(row=r, column=1, sticky="w", pady=1)
+        self._about_rows = [label for label, _ in rows]
+
+        def sep():
+            tk.Frame(body, bg=C["border"], height=1).pack(fill="x", pady=12)
+        sep()
+        tk.Label(body, text=APP_TAGLINE, font=FONTS["small"], fg=C["text"], bg=bg, anchor="w", justify="left",
+                 wraplength=self.px(540)).pack(fill="x")
+        sep()
+        tk.Label(body, text="What it does", font=FONTS["small"] + ("bold",), fg=C["text_bright"], bg=bg,
+                 anchor="w").pack(fill="x", pady=(0, 4))
+        bl = tk.Frame(body, bg=bg)
+        bl.pack(fill="x")
+        bl.columnconfigure(1, weight=1)
+        for r, text in enumerate(APP_FEATURES):
+            tk.Label(bl, text="•", font=FONTS["small"], fg=C["accent_soft"], bg=bg).grid(row=r, column=0,
+                                                                                       sticky="nw", padx=(4, 8))
+            tk.Label(bl, text=text, font=FONTS["small"], fg=C["text"], bg=bg, anchor="w", justify="left",
+                     wraplength=self.px(510)).grid(row=r, column=1, sticky="w", pady=1)
+        self._rich_text(body, [("The version history is in CHANGELOG.md and on the ", None, ""),
+                               ("Releases page", lambda: self._open_url(APP_REPO_URL + "/releases"),
+                                APP_REPO_URL + "/releases"), (".", None, "")],
+                        bg, C["text_dim"]).pack(fill="x", pady=(12, 0))
+        sep()
+        self._rich_text(body, [("Feedback and bug reports are welcome by ", None, ""),
+                               ("email", lambda: self._open_mail(APP_CONTACT, note), APP_CONTACT), (", on ", None, ""),
+                               ("r/SRTStudio", lambda: self._open_url(APP_REDDIT), APP_REDDIT),
+                               (" or as a ", None, ""),
+                               ("GitHub issue", lambda: self._open_url(APP_REPO_URL + "/issues"),
+                                APP_REPO_URL + "/issues"), (".", None, "")],
+                        bg, C["text"]).pack(fill="x")
+        note.pack(fill="x", pady=(6, 0))
+
+        bottom = tk.Frame(dlg, bg=bg)
+        bottom.pack(side="bottom", fill="x", padx=26, pady=(6, 18))
+        self._flat_btn(bottom, "  OK  ", dlg.destroy, primary=True, padx=16, pady=5).pack(side="right")
+        self._flat_btn(bottom, "Check for updates", lambda: self._check_for_updates(manual=True),
+                       padx=12, pady=5).pack(side="right", padx=(0, 8))
+        info = app_version_info(str(self.tk.call("info", "patchlevel")))
+        vi = tk.Frame(dlg, bg=bg)
+        vi.pack(side="bottom", fill="x", padx=26, pady=(10, 0))
+        tk.Label(vi, text=info.split(" · ", 1)[1] if " · " in info else info, font=FONTS["tiny"],
+                 fg=C["text_dim"], bg=bg).pack(side="left")
+        cp = self._link(vi, "Copy", lambda: self._copy_text(info, "Version info copied"), bg=bg)
+        cp.pack(side="left", padx=(8, 0))
+        Tooltip(cp, "Copy the version details, e.g. for a bug report")
+        dlg.bind("<Return>", lambda e: dlg.destroy())
+        try:
+            dlg.update()                 # lets the wrapped sentences find their height first
+        except tk.TclError:
+            return
+        dlg.geometry(f"{self.px(600)}x{max(dlg.winfo_reqheight(), self.px(420))}")
+
+    def _check_for_updates(self, manual: bool = True):
+        if getattr(self, "_update_busy", False):
+            return
+        self._update_busy = True
+        if manual:
+            self.status_text.set("Checking for updates…")
+
+        def work():
+            res = check_latest_release()
+            self._post(lambda: self._update_result(res, manual))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_result(self, res: dict, manual: bool):
+        self._update_busy = False
+        if res["status"] != "error":
+            self._last_update_check = datetime.now().strftime("%Y-%m-%d")
+            save_config({"last_update_check": self._last_update_check})
+        cur = APP_VERSION.lstrip("v")
+        if res["status"] == "newer":
+            self._log(f"Update available: version {res['version']} ({res['url']})", "accent")
+            if manual or res["version"] != self._skipped_version:
+                self._show_update_link(res["version"], res["url"])
+        elif not manual:
+            return
+        if not manual:
+            return
+        C = COLORS
+        if res["status"] == "newer":
+            self.status_text.set(f"Version {res['version']} is available")
+
+            def skip():
+                self._skipped_version = res["version"]
+                save_config({"skipped_version": self._skipped_version})
+                self._update_link.pack_forget()
+            self._message_dialog("Check for updates", "A new version is available",
+                                 [("Your version", cur, C["text"]), ("New version", res["version"], C["success"]),
+                                  ("Download", res["url"], C["text_dim"])],
+                                 [("Skip this version", skip, False), ("Close", lambda: None, False),
+                                  ("Open download page", lambda: self._open_url(res["url"]), True)])
+        elif res["status"] == "latest":
+            self.status_text.set(f"You have the latest version ({cur})")
+            self._message_dialog("Check for updates", "You have the latest version",
+                                 [("Your version", cur, C["text"]),
+                                  ("Latest release", res["version"], C["text_dim"])], [("OK", lambda: None, True)])
+        elif res["status"] == "none":
+            self.status_text.set("No release published on GitHub yet")
+            self._message_dialog("Check for updates", "No release published yet",
+                                 [("Your version", cur, C["text"]),
+                                  ("GitHub", "No release has been published on GitHub yet.", C["text_dim"])],
+                                 [("Open releases page", lambda: self._open_url(res["url"]), False),
+                                  ("OK", lambda: None, True)])
+        else:
+            self.status_text.set("Could not check for updates")
+            self._message_dialog("Check for updates", "Could not check for updates",
+                                 [("Reason", res["error"] or "no answer", C["warning"]),
+                                  ("What to do", "Check the internet connection, or look at the Releases page.",
+                                   C["text"])],
+                                 [("Open releases page", lambda: self._open_url(APP_REPO_URL + "/releases"), False),
+                                  ("OK", lambda: None, True)])
+
     # ── Recent files ─────────────────────────────────────────────────
 
     def _fill_recent_menu(self):
@@ -3878,6 +4551,7 @@ class App(tk.Tk):
         if not same_file(path, self.input_path):
             if not self._confirm_names_switch():
                 return
+            self._cols_user = False              # v0.9.1 (X7): automatic column widths again for a new file
             self._gloss_text.delete("1.0", "end")
             self._gloss_status.configure(text="")
             self._update_names_count()
@@ -4168,9 +4842,7 @@ class App(tk.Tk):
         if not sample:
             self._log(f"Output  : {self.output_path}", "info")
         self._log("═" * 50, "info")
-        notice_text = notice_text_for(self.target_lang.get(),
-                                      model_lbl if engine == "claude" else "MyMemory, machine translation",
-                                      self.notice_text.get())
+        notice_text = notice_text_for(self.target_lang.get(), model_lbl, self.notice_text.get())   # X2: "(MyMemory)"
         # Snapshot every setting on the main thread: Tk variables must not be read from the worker
         run = {
             "engine": engine, "model_id": self.claude_model.get(), "bsize": bsize,
@@ -4218,6 +4890,9 @@ class App(tk.Tk):
         output_path = run["output_path"]
         usage     = UsageTotals()
         errors    = []
+        err_objs  = []                     # v0.9.1 (X1): the exceptions behind `errors`
+        fatal     = []                     # the first error that retrying cannot fix
+        abort     = threading.Event()      # set by a fatal error: the other batches stop
         client    = None
         if engine == "claude":
             client = _anthropic().Anthropic(api_key=run["api_key"], max_retries=3, timeout=180)
@@ -4246,22 +4921,28 @@ class App(tk.Tk):
             return [{**b, "text_lines": b["text_lines"][:], "_untranslated": bool(b["text_lines"])} for b in batch]
 
         def do_batch(idx, batch):
-            if self.cancel_flag:
+            if self.cancel_flag or abort.is_set():
                 return idx, keep_original(batch)
             for attempt in range(3):
-                if self.cancel_flag:
+                if self.cancel_flag or abort.is_set():
                     return idx, keep_original(batch)
                 try:
                     return idx, translate(batch, idx)
                 except Exception as e:
-                    fatal = _is_fatal(e)
-                    if attempt < 2 and not fatal:
+                    is_fatal = _is_fatal(e)
+                    if attempt < 2 and not is_fatal:
                         wait = 2 ** (attempt + 1)
                         self._log(f"Batch {idx + 1} attempt {attempt + 1} failed: {_err(e)}. Retry in {wait}s…", "warn")
                         time.sleep(wait)
                     else:
-                        self._log(f"✗ Batch {idx + 1} failed: {_err(e)} — keeping originals", "error")
-                        errors.append(f"Batch {idx + 1}: {_err(e)}")
+                        with lock:
+                            errors.append(f"Batch {idx + 1}: {_err(e)}")
+                            err_objs.append(e)
+                            if is_fatal and not fatal:
+                                fatal.append(e)
+                                abort.set()
+                        self._log(f"✗ Batch {idx + 1} failed: {_err(e)}"
+                                  + (" — stopping the run" if is_fatal else " — keeping originals"), "error")
                         return idx, keep_original(batch)
             return idx, keep_original(batch)
 
@@ -4275,7 +4956,10 @@ class App(tk.Tk):
                 self.status_text.set(f"Translating…  batch {done_cnt[0]} of {n_batches}  ·  "
                                      f"{n_done:,} of {total:,} blocks")
                 self.pct_label.configure(text=f"{pct:.0f}%")
+                first_tr = not self._tr_lines
                 self._tr_lines.update(part)
+                if first_tr:
+                    self._layout_columns()       # v0.9.1 (X7): the first translations arrived
                 for i, lines in part.items():
                     if self.tree.exists(str(i)):
                         vals = list(self.tree.item(str(i), "values"))
@@ -4291,23 +4975,34 @@ class App(tk.Tk):
         blocks_done = 0
         try:
             for fut in concurrent.futures.as_completed(futs):
-                if self.cancel_flag:
+                if self.cancel_flag or abort.is_set():
                     break
                 bidx, bres = fut.result()
                 results[bidx] = bres
                 with lock:
                     done_cnt[0] += 1
                     blocks_done += len(bres)
+                if any(b.get("_untranslated") for b in bres):
+                    continue                     # v0.9.1: a failed batch is not shown as done
                 progress(blocks_done, bidx, bres)
                 self._log(f"  ✓ Batch {bidx + 1:3d}/{n_batches}  ({len(bres)} blocks)", "info")
         finally:
-            pool.shutdown(wait=not self.cancel_flag, cancel_futures=True)
+            pool.shutdown(wait=not (self.cancel_flag or abort.is_set()), cancel_futures=True)
 
         result = {"engine": engine, "sample": sample, "file": run["file"], "model_id": model_id,
                   "model_name": model.get("display_name", model_id), "usage": usage, "price": price,
                   "estimate": run.get("estimate"), "total": total, "ok": False, "cancelled": False,
                   "saved_path": "", "save_error": "", "flagged": 0, "verified": None, "errors": errors,
-                  "offset": run["offset"]}
+                  "offset": run["offset"], "translated": 0, "kept": [], "failed": ""}
+
+        def fail(info: dict):
+            """v0.9.1 (X1): stop without writing a file or adding the notice."""
+            result.update(failed=info["reason"], fail_kind=info["kind"], fail_short=info["short"],
+                          fail_advice=info["advice"])
+            self._log(f"\n✗ Translation failed: {info['reason']} {info['advice']}", "error")
+            self._log("Nothing was saved" + (" (no file written, no AI notice added)." if not sample else "."),
+                      "error")
+            finish()
 
         def finish():
             result["cost"] = usage.cost(price) if engine == "claude" else None
@@ -4322,6 +5017,9 @@ class App(tk.Tk):
             self._log("Translation cancelled.", "warn")
             result["cancelled"] = True
             finish()
+            return
+        if fatal:
+            fail(failure_info(fatal[0], engine))
             return
 
         out_blocks = [blk for br in results if br is not None for blk in br]
@@ -4347,6 +5045,21 @@ class App(tk.Tk):
                 except Exception as e:
                     self._log(f"  QC retry failed for blocks {chunk[0] + 1}-{chunk[-1] + 1}: {_err(e)}", "warn")
             issues = qc_report(blocks, out_blocks, glossary, cues)
+
+        # ── v0.9.1 (X1): count what really changed; nothing at all → failed, no file ──
+        translatable = [i for i, b in enumerate(blocks)
+                        if any(not is_passthrough(l, cues) for l in b["text_lines"])]
+        changed = [i for i in translatable if out_blocks[i]["text_lines"] != blocks[i]["text_lines"]]
+        kept_idx = [i for i in translatable
+                    if out_blocks[i].get("_untranslated") and out_blocks[i]["text_lines"] == blocks[i]["text_lines"]]
+        result["translated"] = len(changed)
+        result["kept"] = [blocks[i]["id"] for i in kept_idx]
+        if translatable and not changed:
+            fail(failure_info(err_objs[0], engine) if err_objs else nothing_translated_info(engine))
+            return
+        if kept_idx:
+            self._log(f"{len(kept_idx)} block(s) kept in the source language (their batch failed): "
+                      + ", ".join(result["kept"][:30]) + (" …" if len(kept_idx) > 30 else ""), "warn")
 
         for b in out_blocks:
             b.pop("_untranslated", None)
@@ -4416,8 +5129,10 @@ class App(tk.Tk):
                 self._log("\n─── VERIFICATION ───", "accent")
                 for nm, ok in checks:
                     self._log(f"  {'✓' if ok else '✗'} {nm}", "success" if ok else "error")
-                self._log(f"\n{'✅ SUCCESS' if ok_all and not issues else '⚠ Completed with warnings'}"
-                          f" — {total:,} blocks translated & verified", "success" if ok_all and not issues else "warn")
+                good = ok_all and not issues and not kept_idx
+                self._log(f"\n{'✅ SUCCESS' if good else '⚠ Completed with warnings'} — {len(changed):,} of "
+                          f"{total:,} blocks translated · structure "
+                          f"{'verified' if ok_all else 'check FAILED'}", "success" if good else "warn")
             except Exception as e:
                 self._log(f"Verification error: {e}", "error")
         else:
@@ -4471,6 +5186,8 @@ class App(tk.Tk):
                     self.tree.selection_set(first)
         if dialog == "save_failed":
             self._show_save_failed(result)
+        elif dialog == "failed":
+            self._show_failed(result)
         elif dialog == "finished" and self.finish_message.get():
             self._show_finished(result)
 
@@ -4535,19 +5252,39 @@ class App(tk.Tk):
         path = result.get("saved_path", "")
         n_flag = result.get("flagged", 0)
         verified = result.get("verified")
+        kept = result.get("kept") or []
+        total = result.get("total", 0)
         rows = [("Saved", Path(path).name, COLORS["text_bright"]),
                 ("Folder", str(Path(path).parent), COLORS["text_dim"]),
-                ("Blocks", f"{result.get('total', 0):,} translated · "
+                ("Blocks", f"{result.get('translated', total):,} of {total:,} translated · "
                            + (f"{n_flag} flagged" if n_flag else "none flagged") + " · "
                            + ("structure verified ✓" if verified else "structure check FAILED ✗ (see Log)"
                               if verified is False else "structure not checked"),
-                 COLORS["success"] if verified and not n_flag else COLORS["warning"])]
+                 COLORS["success"] if verified and not n_flag and not kept else COLORS["warning"])]
+        if kept:                                                   # v0.9.1 (X1): partial failure
+            ids = ", ".join(kept[:12]) + (" …" if len(kept) > 12 else "")
+            rows.append(("Not translated", f"{len(kept)} block(s) kept in the source language because their "
+                                           f"batch failed: {ids} (marked ⚑). See the Log.", COLORS["warning"]))
         rows += self._cost_rows(result)
         buttons = [("Open folder", lambda: self._open_folder(path), False)]
         if n_flag:
             buttons.append(("Show flagged blocks", self._show_first_flagged, False))
         buttons.append(("OK", lambda: None, True))
-        self._message_dialog("Translation finished", "Translation finished", rows, buttons)
+        title = "Translation finished with problems" if kept else "Translation finished"
+        self._message_dialog(title, title, rows, buttons)
+
+    def _show_failed(self, result: dict):
+        """v0.9.1 (X1): the run stopped; no file was written. Always shown (not tied to the finish-message option)."""
+        rows = [("What happened", result.get("failed", ""), COLORS["error"]),
+                ("What to do", result.get("fail_advice", ""), COLORS["text"]),
+                ("Saved", "nothing — no file was written" if not result.get("sample") else "nothing (sample run)",
+                 COLORS["text_dim"])]
+        rows += self._cost_rows(result)
+        buttons = []
+        if result.get("fail_kind") == "key":
+            buttons.append(("Open Settings", self._show_settings, False))
+        buttons += [("Show log", lambda: self.notebook.select(self.TAB_LOG), False), ("OK", lambda: None, True)]
+        self._message_dialog("Translation failed", "✗  Translation failed", rows, buttons)
 
     def _show_save_failed(self, result: dict):
         rows = [("Could not save", self.output_path, COLORS["text_bright"]),
@@ -4632,7 +5369,7 @@ def _err(e: Exception) -> str:
 
 def _is_fatal(e: Exception) -> bool:
     """Errors that will not get better by retrying (bad key, bad request, refusal)."""
-    if isinstance(e, BatchRefused):
+    if isinstance(e, (BatchRefused, FreeLimitReached)):
         return True
     status = getattr(e, "status_code", None)
     return status in (400, 401, 403, 404, 413, 422)
@@ -4642,10 +5379,24 @@ def _is_fatal(e: Exception) -> bool:
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════
 
+def _prepare_probe_root(root):
+    """v0.9.1 (X3): the hidden root that owns the "Install dependencies" question gets the app name and icon and
+    is kept on top, so the question is not hidden behind other windows."""
+    root.title(APP_NAME)
+    try:
+        ico = asset_path("icon.ico")
+        if os.name == "nt" and ico.exists():
+            root.iconbitmap(default=str(ico))
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+
+
 def main():
     _set_dpi_awareness()
     root_probe = tk.Tk()
     root_probe.withdraw()
+    _prepare_probe_root(root_probe)
     missing = ensure_dependencies(root_probe)
     root_probe.destroy()
     app = App()
