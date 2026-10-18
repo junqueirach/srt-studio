@@ -381,7 +381,7 @@ def test_loader_sorts_versions_as_numbers(tmp_path):
 
 
 def test_loader_picks_this_version():
-    assert st.APP_VERSION == "v0.9.1"
+    assert st.APP_VERSION == "v0.10.0"
 
 
 # ── v0.8.1 · A1: safe writes ────────────────────────────────────────
@@ -610,7 +610,7 @@ def test_utf16_output_roundtrip_is_utf8(tmp_path):
 # ════════════════════════════════════════════════════════════════════
 
 def test_app_renamed():
-    assert st.APP_NAME == "SRT Studio" and st.APP_VERSION == "v0.9.1"
+    assert st.APP_NAME == "SRT Studio" and st.APP_VERSION == "v0.10.0"
     assert st.CONFIG_PATH.name == ".srt_studio_config.json"
 
 
@@ -685,6 +685,9 @@ def test_language_list_and_notice_cover_every_language():
         text = st.notice_text_for(c, "Claude Haiku 5.5")
         assert "Claude Haiku 5.5" in text
         assert c in st._MM_LANG or c.split("-")[0] in ("en",), c
+
+
+
 
 
 # ── F1 formats ───────────────────────────────────────────────────────
@@ -778,6 +781,9 @@ def test_picture_subtitles_refused(tmp_path):
             st.load_subtitle(str(p))
 
 
+
+
+
 # ── R1 check and repair ──────────────────────────────────────────────
 
 BROKEN = """1
@@ -860,6 +866,12 @@ def test_credit_phrase_mid_film_is_not_an_ad():
     blocks = _blocks(*["Line."] * 2000)                        # 66 minutes
     blocks[1000]["text_lines"] = ["Corrected by the teacher, he smiled."]
     assert not [p for p in st.check_subtitle(blocks) if p["kind"] == "ad_line"]
+
+
+
+
+
+
 
 
 # ── N1 notice ────────────────────────────────────────────────────────
@@ -1013,13 +1025,16 @@ def _stub_app(tmp_path):
     return ns
 
 
-def _run_worker(tmp_path, monkeypatch, client_cls=None, engine="claude", free=None, sample=False, n=12, bsize=4):
+def _run_worker(tmp_path, monkeypatch, client_cls=None, engine="claude", free=None, sample=False, n=12, bsize=4,
+                prepare=None):
     text = "".join(f"{i}\n00:00:{10 + 2 * i:02d},000 --> 00:00:{11 + 2 * i:02d},000\nLine number {i} here\n\n"
                    for i in range(1, n + 1))
     blocks = st.parse_srt_text(text)
     src = tmp_path / "Movie.en.srt"
     src.write_text(text, encoding="utf-8")
     doc = st.load_subtitle(str(src))
+    if prepare:                           # v0.10.0: e.g. a sync applied before the run
+        prepare(doc)
     out = tmp_path / "Movie.pt-BR.srt"
     monkeypatch.setattr(st.time, "sleep", lambda s: None)
     if client_cls:
@@ -1178,7 +1193,7 @@ def test_x5_identity_constants():
     assert st.APP_REDDIT == "https://www.reddit.com/r/SRTStudio/"
     assert st.APP_LICENCE == "MIT" and len(st.APP_FEATURES) >= 6
     info = st.app_version_info("8.6.13")
-    assert info.startswith("SRT Studio 0.9.1 · ") and "Python " in info and "Tk 8.6.13" in info
+    assert info.startswith("SRT Studio 0.10.0 · ") and "Python " in info and "Tk 8.6.13" in info
     assert "srt-translator/" not in pathlib.Path(st.__file__).read_text(encoding="utf-8")
 
 
@@ -1210,8 +1225,9 @@ def test_x11_check_latest_release_answers():
                 raise exc
             return type("R", (), {"status_code": status, "json": lambda self: body})()
         return get
-    r = st.check_latest_release(fake(body={"tag_name": "v0.10.0", "html_url": "https://x/rel"}))
-    assert r == {"status": "newer", "version": "0.10.0", "url": "https://x/rel", "error": ""}
+    r = st.check_latest_release(fake(body={"tag_name": "v0.11.0", "html_url": "https://x/rel"}))
+    assert r == {"status": "newer", "version": "0.11.0", "url": "https://x/rel", "error": ""}
+    assert st.check_latest_release(fake(body={"tag_name": "v0.10.0", "html_url": "u"}))["status"] == "latest"
     assert st.check_latest_release(fake(body={"tag_name": "v0.9.1", "html_url": "u"}))["status"] == "latest"
     assert st.check_latest_release(fake(body={"tag_name": "v0.8.0", "html_url": "u"}))["status"] == "latest"
     assert st.check_latest_release(fake(status=404))["status"] == "none"
@@ -1288,3 +1304,347 @@ def test_help_mentions_v091():
     for text in ("NEW IN v0.9.1", "About", "Check for updates", "Dark title bar", "Translation failed",
                  "Running from source", "Help ▾", "F1", "Open folder", "Reddit"):
         assert text.lower() in st.HELP_TEXT.lower(), text
+
+
+# ══ v0.10.0 ══════════════════════════════════════════════════════════
+
+ASS_SYNC_SAMPLE = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, \
+Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, \
+MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Too early
+Comment: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,a comment
+Dialogue: 0,0:00:10.00,0:00:12.00,Default,,0,0,0,,{\\p1}m 0 0 l 10 0 10 10{\\p0}
+Dialogue: 0,0:00:20.00,0:00:22.50,Default,,0,0,0,,Hello{\\i1} there{\\i0}
+"""
+
+
+def _ass_doc(tmp_path):
+    p = tmp_path / "film.en.ass"
+    p.write_text(ASS_SYNC_SAMPLE, encoding="utf-8")
+    return st.load_subtitle(str(p))
+
+
+def test_s1_ass_sync_moves_every_event(tmp_path):
+    doc = _ass_doc(tmp_path)
+    assert len(doc.blocks) == 2                          # the comment and the drawing are not blocks
+    res = st.sync_doc_blocks(doc, doc.blocks, st.srt_sync.map_shift(2_000))
+    doc.blocks = res.blocks
+    out = st._pysubs2().SSAFile.from_string(st.render_subtitle(doc, res.blocks, "same"), format_="ass")
+    assert [(e.start, e.end) for e in out.events] == [(3_000, 4_000), (7_000, 8_000), (12_000, 14_000),
+                                                      (22_000, 24_500)]
+    assert out.events[1].is_comment and "\\p1" in out.events[2].text and "{\\i1}" in out.events[3].text
+    assert st.sync_status_text(doc) == "synced: +2.000 s"
+
+
+def test_s1_ass_sync_drops_events_before_zero(tmp_path):
+    doc = _ass_doc(tmp_path)
+    res = st.sync_doc_blocks(doc, doc.blocks, st.srt_sync.map_shift(-3_000))
+    assert res.dropped == [0] and doc.sync_dropped == {0}
+    out = st._pysubs2().SSAFile.from_string(st.render_subtitle(doc, res.blocks, "same"), format_="ass")
+    assert out.events[0].is_comment
+    assert [(e.start, e.end) for e in out.events] == [(2_000, 3_000), (7_000, 9_000), (17_000, 19_500)]
+    assert st.render_subtitle(doc, res.blocks, "srt").count("-->") == 1     # SRT output: the dialogue block
+
+
+def test_s1_two_syncs_combine_in_the_writer_and_the_status(tmp_path):
+    doc = _ass_doc(tmp_path)
+    r1 = st.sync_doc_blocks(doc, doc.blocks, st.srt_sync.map_shift(1_000))
+    r2 = st.sync_doc_blocks(doc, r1.blocks, st.srt_sync.map_scale(2.0))
+    out = st._pysubs2().SSAFile.from_string(st.render_subtitle(doc, r2.blocks, "same"), format_="ass")
+    assert (out.events[1].start, out.events[3].start) == (12_000, 42_000)       # (5+1)×2, (20+1)×2
+    assert st.sync_status_text(doc) == "synced: speed ×2.00000, +2.000 s"
+
+
+def test_s1_srt_drop_renumbers():
+    blocks = st.parse_srt_text(SAMPLE)
+    doc = st.SubDoc("x.srt", "srt", "SRT", "utf-8", blocks)
+    res = st.sync_doc_blocks(doc, blocks, st.srt_sync.map_shift(-7_500))
+    assert [b["id"] for b in res.blocks] == [str(i + 1) for i in range(len(res.blocks))]
+    assert len(res.blocks) == len(blocks) - 1
+
+
+def test_s1_backup_names_never_replace_an_older_one(tmp_path):
+    f = tmp_path / "a.srt"
+    f.write_text("one", encoding="utf-8")
+    assert st.write_backup(f).name == "a.srt.bak"
+    f.write_text("two", encoding="utf-8")
+    assert st.write_backup(f).name == "a.srt.bak2"
+    assert (tmp_path / "a.srt.bak").read_text(encoding="utf-8") == "one"
+
+
+def test_s1_apply_then_translate_keeps_the_new_times(tmp_path, monkeypatch):
+    shift = 2_500
+
+    def prepare(doc):
+        res = st.sync_doc_blocks(doc, doc.blocks, st.srt_sync.map_shift(shift))
+        doc.blocks = res.blocks
+
+    result, out, _, blocks = _run_worker(tmp_path, monkeypatch, engine="free", prepare=prepare,
+                                         free=lambda lines, s, t, c=True: ["PT " + l for l in lines])
+    assert result["ok"] and result["verified"] is True
+    saved = st.parse_srt(str(out))[0]
+    got = [st.timestamp_ms(b["timestamp"]) for b in saved if b["text_lines"][0].startswith("PT ")]
+    want = [(s + shift, e + shift) for s, e in (st.timestamp_ms(b["timestamp"]) for b in blocks)]
+    assert got == want
+
+
+def test_s1_sync_tab_apply_undo_save(gui_app, tmp_path):
+    app = gui_app
+    src = tmp_path / "Film.en.srt"
+    src.write_text(SAMPLE, encoding="utf-8")
+    app._load_source_file(str(src))
+    orig = [b["timestamp"] for b in app.source_blocks]
+    assert app.notebook.tab(app.TAB_SYNC, "text").strip() == "Sync" and app.TAB_LOG == 3
+    assert [m[1] for m in st.SYNC_METHODS][:3] == ["auto_sub", "auto_video", "auto_track"]   # decision 24
+    assert app._sync_row_chip.cget("text") == "not checked"
+    app._select_sync_method("shift")
+    assert str(app._sync_apply_btn.cget("state")) == "disabled"        # nothing to change yet
+    app._sh_var.set("2.5")
+    assert app._sync_pending and app._sync_pending[1].moved == len(orig)
+    assert app._sync_tree.get_children()
+    app._sync_apply()
+    assert app.source_blocks[0]["timestamp"] == "00:00:04,645 --> 00:00:09,685"
+    assert app._sync_row_chip.cget("text") == "✓ synced: +2.500 s"
+    assert app._filter_btns["synced"].cget("text") == f"Synced {len(orig)}"
+    assert "Shift +2.500 s" in app._sync_report_text()
+    # a second change goes on top of the first; Undo restores the times of the file
+    app._select_sync_method("scale")
+    app._fr_from.set("25")
+    app._fr_to.set("23.976")
+    app._sync_apply()
+    assert "synced: 25 → 23.976 fps" in app._sync_row_chip.cget("text")
+    app._sync_undo()
+    assert [b["timestamp"] for b in app.source_blocks] == orig and not app.doc.time_maps
+    assert app._sync_row_chip.cget("text") == "not checked"
+    # two points: block 1 → 00:00:03,145 and the last block → its time + 1 s  ⇒ a pure +1 s shift
+    app._select_sync_method("two_point")
+    app._tp["a"]["block"].set("1")
+    app._tp["a"]["correct"].set("00:00:03,145")
+    last = app.source_blocks[-1]
+    app._tp["b"]["block"].set(last["id"])
+    app._tp["b"]["correct"].set(st.srt_sync.fmt_ms(st.timestamp_ms(last["timestamp"])[0] + 1_000))
+    assert app._sync_pending and abs(app._sync_pending[0].ratio - 1) < 1e-9
+    app._sync_apply()
+    # Save synced copy over the original: a .bak first, then the new times in the file
+    app._sync_save_copy(out=str(src))
+    app._sync_report_dlg.destroy()
+    assert (tmp_path / "Film.en.srt.bak").read_text(encoding="utf-8") == SAMPLE
+    saved = st.parse_srt(str(src))[0]
+    assert saved[0]["timestamp"] == "00:00:03,145 --> 00:00:08,185"
+    assert "Backup:" in app._sync_report_text() and str(src) in app._sync_report_text()
+    # an impossible value is refused, never applied
+    app._select_sync_method("shift")
+    app._sh_var.set("abc")
+    assert app._sync_pending is None and app._sv_title.cget("text") == "Cannot use these values"
+    assert str(app._sync_apply_btn.cget("state")) == "disabled"
+    app._sh_var.set("0")
+
+
+def _synthetic_srt(seed, shift_ms=0, n=400):
+    import random
+    rnd = random.Random(seed)
+    t, parts = 20_000, []
+    for i in range(n):
+        d = rnd.randint(1_000, 5_000)
+        parts.append(f"{i + 1}\n{st.make_timestamp(t + shift_ms, t + d + shift_ms)}\nLine {i + 1} of the film\n")
+        t += d + (rnd.randint(30_000, 90_000) if rnd.random() < 0.02 else rnd.randint(100, 6_000))
+    return "\n".join(parts) + "\n"
+
+
+def _pump_until(app, cond, timeout=60):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        app.update()
+        if cond():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_s2_check_on_load_fix_it_and_folder(gui_app, tmp_path):
+    pytest.importorskip("numpy")
+    app = gui_app
+    (tmp_path / "Film.pt.srt").write_text(_synthetic_srt(4), encoding="utf-8")            # in sync (reference)
+    (tmp_path / "Film.en.srt").write_text(_synthetic_srt(4, 2_500), encoding="utf-8")     # 2.5 s late
+    (tmp_path / "Other.en.srt").write_text(_synthetic_srt(77), encoding="utf-8")         # another film
+    assert st.reference_candidates(str(tmp_path / "Film.en.srt")) == [str(tmp_path / "Film.pt.srt")]
+    app.sync_check_on_load.set(True)
+    app._load_source_file(str(tmp_path / "Film.en.srt"))
+    assert _pump_until(app, lambda: app._sync_check is not None), "the check on load did not finish"
+    res = app._sync_check[0]
+    assert res.status == "offset" and abs(res.offset_ms + 2_500) <= 10
+    assert app._sync_row_chip.cget("text") == "⚠ +2.5 s vs Film.pt.srt"
+    assert app._sync_row_link.cget("text") == "Fix…"
+    orig = [b["timestamp"] for b in app.source_blocks]
+    assert [b["timestamp"] for b in app.source_blocks] == orig          # a check never changes anything
+    app._open_sync_tab()
+    assert app._sync_method == "auto_sub"
+    assert app._sv_btn.cget("text") == "Fix it: shift −2.500 s" and app._sv_btn.winfo_manager() == "grid"
+    assert app._facts["offset"].cget("text") == "+2.500 s" and app._facts["match"].cget("text").endswith("→ 1.00")
+    vals = [app._sync_tree.item(i, "values") for i in app._sync_tree.get_children()]
+    assert any(v[4] for v in vals if len(v) > 4)                           # the reference line next to each line
+    app._sv_btn.invoke()                                                   # Fix it
+    assert app._sync_row_chip.cget("text") == "✓ synced: −2.500 s"
+    assert "Reference:   Film.pt.srt" in app._sync_report_text()
+    assert "To another subtitle" in app._sync_report_text()
+    app._sync_undo()
+    # Check sync: status only, then Fix it… opens the sync with the result
+    app._select_sync_method("check")
+    app._set_reference(str(tmp_path / "Other.en.srt"))
+    app._sync_analyse()
+    assert _pump_until(app, lambda: app._sync_job is None and app._auto_valid() is not None)
+    assert app._auto["res"].status == "cannot_tell" and app._sync_row_chip.cget("text").startswith("? cannot tell")
+    assert app._sv_btn.winfo_manager() == ""                                # nothing to fix: no button
+    # Check a folder: the two other subtitles against the loaded one
+    app._check_folder(str(tmp_path))
+    assert _pump_until(app, lambda: getattr(app, "_folder_dlg", None) is not None and app._sync_job is None)
+    got = {pathlib.Path(r["file"]).name: r["status"] for r in app._folder_rows}
+    assert got == {"Film.pt.srt": "offset", "Other.en.srt": "cannot_tell"}
+    assert "Film.pt.srt" in st.folder_report_text("Film.en.srt", app._folder_rows)
+    app._folder_dlg.destroy()
+    app._folder_dlg = None
+    app._select_sync_method("shift")
+
+
+def test_help_mentions_v0100():
+    for text in ("NEW IN v0.10.0", "Sync tab", "Ctrl+1, 2, 3, 4", "Shift", "Frame rate", "Two points", "Hints",
+                 "Try it", "Undo sync", "Save synced copy", "Sync report", "To another", "Check sync",
+                 "Check on load", "SYNC CHECK", "Check a folder", "Cannot tell", "Different cut", "Fix it",
+                 "Confidence", ".bak", "Video tools", "FFmpeg", "LGPL", "VIDEO TOOLS", "To the video",
+                 "centre channel", "Reference", "Track in a", "From video", "OCR", "never changed"):
+        assert text.lower() in st.HELP_TEXT.lower(), text
+
+
+def test_s3_ensure_ffmpeg_asks_downloads_and_reports(gui_app, tmp_path, monkeypatch):
+    app = gui_app
+    got = []
+    monkeypatch.setattr(st.srt_media, "find_ffmpeg", lambda *a, **k: {"ffmpeg": "f", "ffprobe": "p", "source": "path"})
+    app.ensure_ffmpeg("Sync to the video", got.append)
+    assert got and got[0]["source"] == "path"                       # found: no question
+    monkeypatch.setattr(st.srt_media, "find_ffmpeg", lambda *a, **k: None)
+    app.ensure_ffmpeg("Sync to the video", got.append)
+    assert app._ff_ask.winfo_exists() and app._ff_ask.title() == "Video tools needed"
+    app._ff_ask.destroy()
+    done = {"ffmpeg": str(tmp_path / "ffmpeg.exe"), "ffprobe": str(tmp_path / "ffprobe.exe"), "source": "downloaded"}
+
+    def fake_download(progress=None, cancel=None, **kw):
+        for k in range(1, 5):
+            progress(k * 25, 100)
+        return done
+    monkeypatch.setattr(st.srt_media, "download_ffmpeg", fake_download)
+    app._download_ffmpeg(got.append)
+    assert _pump_until(app, lambda: len(got) == 2)
+    assert got[1] is done and app._ff_job is None and not app._ff_dlg.winfo_exists()
+    assert st.APP_FEATURES[-1].endswith("(video tools: FFmpeg, LGPL, downloaded on demand)")
+    assert "ffmpeg_path" in app._settings_snapshot()
+
+
+def test_s4_to_the_video_with_a_fake_audio(gui_app, tmp_path, monkeypatch):
+    np = pytest.importorskip("numpy")
+    app = gui_app
+    sub = tmp_path / "Clip.en.srt"
+    sub.write_text(_synthetic_srt(6, 1_800), encoding="utf-8")                 # 1.8 s late against the speech
+    (tmp_path / "Clip.mkv").write_bytes(b"not really a video")
+    assert st.video_candidates(str(sub)) == [str(tmp_path / "Clip.mkv")]
+    speech = np.array([st.timestamp_ms(b["timestamp"]) for b in st.parse_srt_text(_synthetic_srt(6))], float)
+    probe = {"duration_ms": 1_200_000, "format": "matroska", "streams": [
+        {"index": 0, "type": "video", "codec": "h264", "language": "", "title": "", "default": True, "forced": False,
+         "channels": None, "fps": 23.976},
+        {"index": 1, "type": "audio", "codec": "ac3", "language": "por", "title": "", "default": True,
+         "forced": False, "channels": 6, "fps": None},
+        {"index": 2, "type": "audio", "codec": "aac", "language": "eng", "title": "Original", "default": False,
+         "forced": False, "channels": 2, "fps": None}]}
+    used = []
+    monkeypatch.setattr(st.srt_media, "find_ffmpeg", lambda *a, **k: {"ffmpeg": "f", "ffprobe": "p", "source": "path"})
+    monkeypatch.setattr(st.srt_media, "probe", lambda ff, path, timeout=60: probe)
+    monkeypatch.setattr(st.srt_media, "load_cached_speech", lambda *a, **k: None)
+    monkeypatch.setattr(st.srt_media, "save_cached_speech", lambda *a, **k: None)
+
+    def fake_detect(ff, video, index, duration, progress=None, cancel=None, **kw):
+        used.append(index)
+        for k in range(5):
+            progress(k / 4)
+        return {"times": speech, "detector": "webrtcvad", "length_ms": 1_200_000, "elapsed": 1.0}
+    monkeypatch.setattr(st.srt_media, "detect_speech", fake_detect)
+    app.sync_check_on_load.set(False)
+    app._load_source_file(str(sub))
+    app.notebook.select(app.TAB_SYNC)
+    app._select_sync_method("auto_video")
+    assert app._video_path == str(tmp_path / "Clip.mkv")
+    app._video_analyse()
+    assert _pump_until(app, lambda: app._sync_job is None and app._auto_valid("auto_video") is not None)
+    assert used == [2]                                       # the English track for an English subtitle
+    res = app._auto["res"]
+    assert res.reference == "audio" and res.status == "offset" and abs(res.offset_ms + 1_800) <= 20
+    assert app._sv_btn.cget("text") == "Fix it: shift −1.800 s"
+    assert app._sync_row_chip.cget("text").startswith("⚠ +1.8 s vs Clip.mkv")
+    app._sv_btn.invoke()
+    assert app._sync_row_chip.cget("text") == "✓ synced: −1.800 s"
+    rep = app._sync_report_text()
+    assert "Method:      To the video" in rep and "Track 2:" in rep and "speech: webrtcvad" in rep
+    app._sync_undo()
+    app._select_sync_method("shift")
+
+
+def test_s5_track_helpers():
+    tracks = [{"n": 1, "index": 2, "language": "eng", "title": "English", "forced": False, "sdh": False,
+               "default": True, "text": True, "ext": ".srt", "lines": 400},
+              {"n": 2, "index": 3, "language": "eng", "title": "English [SDH]", "forced": False, "sdh": True,
+               "default": False, "text": True, "ext": ".srt", "lines": 480},
+              {"n": 3, "index": 4, "language": "por", "title": "", "forced": False, "sdh": False,
+               "default": False, "text": True, "ext": ".ass", "lines": 390},
+              {"n": 4, "index": 5, "language": "por", "title": "", "forced": False, "sdh": False,
+               "default": False, "text": False, "ext": "", "lines": 0}]
+    assert st.best_track(tracks, "en-US") == 0 and st.best_track(tracks, "pt-BR") == 2
+    assert st.best_track(tracks, "th-TH") == 0 and st.best_track([tracks[3]], "pt-BR") == -1
+    assert st.track_virtual_path(r"D:\v\Movie.mkv", tracks[2]).endswith("Movie.pt.ass")
+    assert st.track_display("D:/v/Movie.mkv", tracks[0]).startswith("Movie.mkv · track 1 (English")
+    # tracks in languages the app does not translate still get a name (not "bul", "hrv", "mac")
+    assert [st.language_name(c) for c in ("bul", "hrv", "mac", "nor", "eng")] == \
+        ["Bulgarian", "Croatian", "Macedonian", "Norwegian", "English"]
+    assert st.language_name("xx") == ""
+
+
+def test_s5_picker_load_and_reference(gui_app, tmp_path):
+    app = gui_app
+    video = tmp_path / "Show.mkv"
+    video.write_bytes(b"x")
+    f1, f2 = tmp_path / "t2.srt", tmp_path / "t3.srt"
+    f1.write_text(_synthetic_srt(3), encoding="utf-8")
+    f2.write_text(_synthetic_srt(3, 900), encoding="utf-8")
+    tracks = [{"n": 1, "index": 2, "codec": "subrip", "language": "eng", "title": "English", "forced": False,
+               "sdh": False, "default": True, "text": True, "ext": ".srt", "note": "", "file": str(f1), "lines": 400},
+              {"n": 2, "index": 3, "codec": "subrip", "language": "por", "title": "", "forced": False, "sdh": False,
+               "default": False, "text": True, "ext": ".srt", "note": "", "file": str(f2), "lines": 400},
+              {"n": 3, "index": 4, "codec": "hdmv_pgs_subtitle", "language": "spa", "title": "", "forced": False,
+               "sdh": False, "default": False, "text": False, "ext": "", "note": "PGS needs OCR", "file": ""}]
+    app.sync_check_on_load.set(False)
+    app.source_lang.set("en-US")
+    app._show_track_picker(str(video), tracks, "source")
+    assert app._track_tree.selection() == ("0",)
+    assert "pic" in app._track_tree.item("2", "tags")
+    load = [w for w in app._track_dlg.winfo_children()[1].winfo_children()
+            if isinstance(w, st.tk.Button) and w.cget("text") == "Load and translate"][0]
+    load.invoke()
+    assert app.input_path == str(tmp_path / "Show.en.srt") and app._origin["track"]["n"] == 1
+    assert [w.cget("text") for w in app._chips.winfo_children()][0] == "from MKV · track 1"
+    assert app._output_name().startswith("Show.") and str(video) in app._recent
+    app._show_track_picker(str(video), tracks, "reference")
+    app._track_tree.selection_set("1")
+    ref = [w for w in app._track_dlg.winfo_children()[1].winfo_children()
+           if isinstance(w, st.tk.Button) and w.cget("text") == "Use as sync reference"][0]
+    ref.invoke()
+    assert app._ref_path == str(f2) and app._ref_label.cget("text").startswith("Show.mkv · track 2")
+    assert app._sync_method == "auto_sub"
+    app._select_sync_method("shift")

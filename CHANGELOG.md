@@ -2,6 +2,38 @@
 
 All notable changes to SRT Studio (SRT Translator until v0.8.1). Dates are release dates.
 
+## v0.10.0 — 2026-10-18
+
+Sync: fix the timing of a subtitle, against another subtitle, the video's audio or a track inside a video; and subtitles taken straight from MKV/MP4.
+
+### Added
+- **Sync tab** (between Names and Log, Ctrl+3; Log is now Ctrl+4). Methods on the left: **Automatic** first (to another subtitle, to the video, to a track inside a video), then **Check**, then **Fine-tune**. On the right: one sentence with the result, the key numbers (offset, speed, cuts, match, unmatched blocks), a preview of the old and new times (first, middle and last lines) and a timeline of the two
+- **Sync to another subtitle** (any language: only the timing is compared). Finds the offset, the frame-rate difference (9 candidates) and **cuts** (another version of the film: a window path over the whole film, and a part with another offset is kept only when its own lines match clearly better there than at any other offset). **Uneven timing** is fixed section by section. The result: one sentence with **Fix it**, the key numbers, the preview with the reference line next to each line, and the timeline (reference / now / after). Confidence below 0.5 asks before it applies; "? Cannot tell" (another film) changes nothing. Runs in the background with progress and Cancel (2–7 s for a film)
+- **Check sync** (status only): ✅ In sync · ⚠ Constant offset · ⚠ Speed drift · ⚠ Offset and drift · ⚠ Uneven timing · ⛔ Different cut · ? Cannot tell, shown on the SOURCE card ("⚠ +2.5 s vs Movie.pt.srt") with Fix…
+- **Check on load** (Settings → Output → SYNC CHECK, on by default): compares a newly opened subtitle with the context file or another subtitle of the same film next to it; it only reports
+- **Check a folder…**: every subtitle in a folder against the loaded one, one status table, Copy report and Save report…
+- New setting `sync_check_on_load`
+- **Fine-tune by hand**: **Shift** (seconds or a time, −1 s … +1 s buttons), **Frame rate** (8 presets such as 25 → 23.976, or any two rates), **Two points** (the correct time of a line near the start and one near the end: fixes offset and speed together)
+- **Hints** when there is nothing to compare against: a first line unusually late or early, lines after the end of the video (probable frame-rate mismatch); **Try it** fills in Fine-tune
+- **Apply** gives the loaded subtitle the new times (a translation started afterwards uses them); a second Apply goes on top; **Undo sync** brings back the times of the file. A block that would end before 0:00 is dropped and a start below 0:00 is clamped; both are listed
+- **Save synced copy…** in the file's own format; ASS comments, drawings and signs move with the dialogue. Overwriting the original writes `<name>.bak` first (an older `.bak` is never replaced: `.bak2`, `.bak3`…)
+- **Sync report** for every applied sync (file, method, offset and speed, blocks moved / clamped / dropped, before-and-after sample, output and backup files): **Report…** with **Copy** and **Save as .txt**; a short line in the Activity Log
+- SOURCE card: **Sync** row ("not checked" / "✓ synced: +2.350 s") with a link to the Sync tab; Subtitles table: **Synced** filter
+- **Sync to the video's audio** (To the video): choose the video (suggested: the one next to the subtitle) and the audio track (the subtitle's language); FFmpeg streams the audio (the **centre channel** of 5.1/7.1, where film dialogue is), webrtcvad finds the speech (an energy detector if it is missing), and the same engine finds offset, frame rate, cuts and uneven sections. The confidence comes from how clearly the best offset stands out. Speech with no subtitle for more than 60 s is listed (a scene not in the subtitle's version). The speech is cached per video. Progress, Cancel (FFmpeg is stopped at once)
+- **Is the reference in sync?** With a video next to the subtitle, To another subtitle can check the reference against the audio first and warns when it is off
+- **Open a video directly** (toolbar **From video…**, Open…, Recent ▾, drag and drop; decision 25): its subtitle tracks (one pass over the file) in a picker with language, title, format, flags and line count; picture tracks listed but disabled (OCR). **Load and translate** (saved next to the video), **Use as sync reference**, or **Save as file…** (ASS stays ASS). Sync method **Track in a video**. The video is never written
+- **Video tools (FFmpeg) on demand**: looked for in Settings (`ffmpeg_path`), then `~/.srt_studio/tools/ffmpeg/`, then the PATH. When missing, the app offers to download an **LGPL** build (BtbN, n8.1.3, about 81 MB, pinned URL, size and SHA-256; only ffmpeg/ffprobe, their DLLs and the licence are kept; it must run before it is installed) with a progress bar and Cancel, or to choose an ffmpeg.exe. Every FFmpeg process runs without a window, at below-normal priority, with a timeout; Cancel kills it. Settings → General → VIDEO TOOLS. `srt_media.py` holds this, tested with a local server and fake processes (`tests/test_media.py`)
+- `srt_sync.py`: the timing core (shift, frame-rate scale, two points, piecewise maps), pure and unit-tested (`tests/test_sync.py`)
+- New dependencies: `numpy`, `webrtcvad-wheels` (offered by "Install dependencies" when running from source)
+
+- Subtitle tracks in languages outside the translation list are named (Bulgarian, Croatian, Macedonian…), not shown as codes
+
+### Known limits
+- Against the video's audio, offset and speed are reliable; cuts, intros and inserted scenes are found only sometimes
+  (speech detection also hears music and effects). For another version of the film, sync to a subtitle of that version
+- Random errors of single lines (±0.15–0.3 s) are not found against a subtitle in another language: two good subtitles
+  already differ by about 0.06–0.14 s per line. With a reference that shares the timing they are found and fixed
+
 ## v0.9.1 — 2026-10-16
 
 Fixes found after v0.9.0 and a polished window.
@@ -28,7 +60,7 @@ Fixes found after v0.9.0 and a polished window.
 - The "from the middle" box next to Sample is sized from its text (it was clipped)
 - Settings → General: the price override file shows its status (found / not present), a short path with the full path in the tooltip, **Open folder** and **Copy path**
 - README links point to the renamed repository `junqueirach/srt-studio`; User-Agent `SRT-Studio/<version>`
-- Tests: 127 → 148 (failed and partial runs with a fake client, MyMemory errors, notice text, icons, update check, column widths, About, Help menu, cursor); the window tests skip on a machine without a display (GitHub CI). (the Windows GUI harness is kept outside this repository)
+- Tests: 127 → 148 (failed and partial runs with a fake client, MyMemory errors, notice text, icons, update check, column widths, About, Help menu, cursor); the window tests skip on a machine without a display (GitHub CI). GUI harness kept as `tools/gui_harness.py`
 
 ## v0.9.0 — 2026-10-15
 

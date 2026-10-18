@@ -37,3 +37,12 @@ pricing.json
 
 # Private notes
 docs/todo.txt
+
+# Build output and caches
+dist/
+build/
+*.spec
+.pytest_cache/
+
+# Local GUI harness: uses the private test media (real film files), not published
+tools/gui_harness.py

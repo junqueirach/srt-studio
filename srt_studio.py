@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════╗
-║          SRT Studio  v0.9.1 — Desktop GUI                 ║
+║          SRT Studio  v0.10.0 — Desktop GUI                ║
 ║     (formerly SRT Subtitle Translator, renamed in 0.9.0)  ║
 ║  Subtitle translation and repair, structure preserved:    ║
 ║  SRT · ASS/SSA · WebVTT · MicroDVD · SAMI · TTML          ║
 ║  Engines: Claude API · MyMemory (free)                    ║
 ║  Author:  Luiz Junqueira & Claude AI                      ║
 ╚═══════════════════════════════════════════════════════════╝
+
+v0.10.0 changes (sync):
+  • Sync tab (between Names and Log): Automatic, Check and Fine-tune
+    methods on the left; verdict, key numbers, preview and timeline
+  • Fine-tune: Shift, Frame rate (presets + custom), Two points;
+    hints from the subtitle alone with Try it
+  • Apply / Undo sync / Save synced copy (.bak first), sync report
+    (Copy, Save as .txt); ASS comments and drawings move too
+  • Timing core in srt_sync.py (pure, unit-tested)
 
 v0.9.1 changes (fixes and polish):
   • A run that fails (e.g. the API key is rejected) saves no file and adds no
@@ -113,7 +122,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 # VERSION
 # ═══════════════════════════════════════════════════════════════════════
 
-APP_VERSION = "v0.9.1"
+APP_VERSION = "v0.10.0"
 APP_NAME    = "SRT Studio"          # formerly "SRT Subtitle Translator" (renamed in v0.9.0)
 APP_TITLE   = f"{APP_NAME}  {APP_VERSION}"
 APP_ID      = "SRTStudio.App"       # Windows taskbar identity (icon grouping)
@@ -131,9 +140,15 @@ APP_FEATURES = [   # About window (X5); keep in line with the README "What it do
     "Shows the estimated cost before a run and the real cost after",
     "Keeps character names and hearing-impaired cues; can use a context file (same film in another language)",
     "Adds a short \"translated by AI\" notice in the target language",
+    "Syncs subtitles to another subtitle or to the video (video tools: FFmpeg, LGPL, downloaded on demand)",
 ]
 IS_FROZEN   = bool(getattr(sys, "frozen", False))
 APP_DIR     = Path(sys.executable).parent if IS_FROZEN else Path(__file__).resolve().parent
+
+if not IS_FROZEN and str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))      # srt_sync.py sits next to this file
+import srt_sync  # noqa: E402  (v0.10.0: the timing core for sync, pure functions)
+import srt_media  # noqa: E402  (v0.10.0: FFmpeg on demand, ffprobe, audio for sync to the video)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -146,6 +161,8 @@ REQUIRED_PACKAGES = [
     ("anthropic",   "anthropic",   "Claude API engine"),
     ("pysubs2",     "pysubs2",     "subtitle formats other than SRT (ASS, SSA, WebVTT, MicroDVD…)"),
     ("tkinterdnd2", "tkinterdnd2", "drag and drop of files onto the window"),
+    ("numpy",       "numpy",       "sync to another subtitle or to the video (v0.10.0)"),
+    ("webrtcvad",   "webrtcvad-wheels", "speech detection for sync to the video's audio (v0.10.0)"),
 ]
 
 
@@ -197,6 +214,11 @@ def ensure_dependencies(parent=None) -> list:
     return still
 
 
+def _has_numpy() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("numpy") is not None
+
+
 def _anthropic():
     import anthropic  # noqa: F401  (lazy so the module imports without it)
     return anthropic
@@ -235,6 +257,23 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8"):
             pass
         if isinstance(e, OSError) and e.filename and str(e.filename).endswith(".tmp"):
             raise OSError(e.errno, e.strerror, str(path)) from e     # name the real file, not the temp one
+        raise
+
+
+def _atomic_write_bytes(path: Path, data: bytes):
+    """Write bytes to a temp file next to the target, then replace it (never half a file)."""
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         raise
 
 
@@ -326,6 +365,7 @@ COLORS = {   # v0.9.0 palette (approved mockup)
     "chip_warn_bg": "#2d2716", "chip_warn_bd": "#6b5420",
     "chip_bad_bg":  "#2c1817", "chip_bad_bd":  "#6d2b28",
     "chip_sel_fg":  "#cfe0ff", "chip_sel_bg":  "#1c3355", "chip_sel_bd":  "#2f5ea8",
+    "timeline_bg":  "#151d2a", "lane_bg":      "#1c2635", "verdict_warn_sub": "#cdbf9a",   # v0.10.0 Sync tab
 }
 
 FONTS = {
@@ -471,6 +511,10 @@ TEXT_FORMATS = {   # extension → (pysubs2 format id, label)
 PICTURE_EXTS = {".sup": "PGS (Blu-ray)", ".idx": "VobSub (DVD)"}
 OPEN_FILETYPES = [("Subtitles", " ".join(f"*{e}" for e in TEXT_FORMATS)), ("SRT", "*.srt"),
                   ("ASS / SSA", "*.ass *.ssa"), ("WebVTT", "*.vtt"), ("All files", "*.*")]
+OPEN_VIDEO_EXTS = (".mkv", ".mp4", ".m4v", ".mov", ".webm", ".avi")         # v0.10.0 (S5, decision 25)
+OPEN_ANY_FILETYPES = [("Subtitles and videos", " ".join(f"*{e}" for e in list(TEXT_FORMATS) + list(OPEN_VIDEO_EXTS))),
+                      ("Subtitles", " ".join(f"*{e}" for e in TEXT_FORMATS)),
+                      ("Videos (subtitles inside)", " ".join(f"*{e}" for e in OPEN_VIDEO_EXTS)), ("All files", "*.*")]
 DEFAULT_FPS = 23.976
 _ASS_DRAWING_RE = re.compile(r"\{[^}]*\\p[1-9]")
 
@@ -506,6 +550,14 @@ class SubDoc:
         self.blocks, self.ssa, self.fps = blocks, ssa, fps
         self.problems = problems or []
         self.removed_events = set()      # ASS/VTT event indexes removed by the repair (ad lines)
+        self.time_maps = []              # v0.10.0 (S1): sync maps applied in the app, oldest first
+        self.sync_dropped = set()        # ASS/VTT event indexes dropped by a sync (ended before 0:00)
+
+    def retime(self, ms: int) -> int:
+        """An original event time after every applied sync (for ASS comments and drawings, which are not blocks)."""
+        for tmap in self.time_maps:
+            ms = tmap(ms)
+        return ms
 
     @property
     def is_srt(self) -> bool:
@@ -579,9 +631,11 @@ def render_subtitle(doc: SubDoc, blocks: list, output_format: str = "same") -> s
         b = by_ev.get(i)
         if b is not None:
             ev.text = "\\N".join(b["text_lines"])
-            if b.get("_repaired"):
+            if b.get("_repaired") or b.get("_synced") or doc.time_maps:
                 ev.start, ev.end = timestamp_ms(b["timestamp"])
-    for i in sorted(doc.removed_events, reverse=True):
+        elif doc.time_maps:              # v0.10.0 (S1): comments, drawings and signs move with the sync
+            ev.start, ev.end = max(0, doc.retime(ev.start)), max(0, doc.retime(ev.end))
+    for i in sorted(doc.removed_events | doc.sync_dropped, reverse=True):
         del ssa.events[i]
     notices = [b for b in blocks if b.get("_notice")]
     for b in notices:
@@ -629,6 +683,242 @@ def output_encoding_for(choice: str, source_encoding: str, text: str, is_srt: bo
 def write_subtitle_text(text: str, path: str, encoding: str = "utf-8-sig"):
     """Atomic write; the SRT writer already starts with a BOM character, so it is not doubled."""
     _atomic_write_text(Path(path), text.lstrip("\ufeff"), encoding=encoding)   # the codec writes any BOM
+
+
+def backup_path_for(path) -> Path:
+    """<name>.bak, or .bak2, .bak3\u2026 when older backups exist: an older backup is never replaced (Q1)."""
+    src = Path(path)
+    for k in range(1, 10_000):
+        bak = src.with_name(src.name + (".bak" if k == 1 else f".bak{k}"))
+        if not bak.exists():
+            return bak
+    raise OSError(f"too many backups of {src.name}")
+
+
+def write_backup(path) -> Path:
+    """Copy the file to its next free .bak name before it is overwritten. Returns the backup path."""
+    bak = backup_path_for(path)
+    bak.write_bytes(Path(path).read_bytes())
+    return bak
+
+
+# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# SYNC  (v0.10.0 \u00b7 S1)  \u2014  the maths is in srt_sync.py; this applies it to a loaded subtitle
+# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+
+def sync_doc_blocks(doc, blocks: list, tmap) -> "srt_sync.SyncResult":
+    """Retime the loaded blocks with tmap and record the map on the document, so the writer also moves ASS
+    comments and drawings. Blocks that end before 0:00 are dropped (and their events removed); SRT blocks are
+    then renumbered so the numbers stay 1, 2, 3\u2026"""
+    res = srt_sync.apply_map(blocks, tmap)
+    if doc is not None:
+        doc.time_maps.append(tmap)
+        if not doc.is_srt:
+            doc.sync_dropped |= {blocks[i]["_ev"] for i in res.dropped if "_ev" in blocks[i]}
+    if res.dropped and all(str(b.get("id", "")).isdigit() for b in res.blocks):
+        res.blocks = [{**b, "id": str(k + 1)} for k, b in enumerate(res.blocks)]
+    return res
+
+
+def sync_status_text(doc) -> str:
+    """'synced: +2.350 s' / 'synced: 25 \u2192 23.976 fps' / 'synced: 2 changes' for the SOURCE card; '' if not synced."""
+    maps = getattr(doc, "time_maps", None) or []
+    if not maps:
+        return ""
+    if all(m.is_linear for m in maps):
+        ratio, off = 1.0, 0.0
+        for m in maps:          # r·t + o, then mr·t + mo  →  (r·mr)·t + (o·mr + mo)
+            _, mr, mo = m.segments[0]
+            ratio, off = ratio * mr, off * mr + mo
+        if abs(ratio - 1) < 1e-9:
+            return f"synced: {srt_sync.fmt_offset(off)}"
+        desc = srt_sync.describe_ratio(ratio)
+        return f"synced: {desc}" if abs(off) < 0.5 else f"synced: {desc}, {srt_sync.fmt_offset(off)}"
+    return f"synced: {maps[0].label}" if len(maps) == 1 else f"synced: {len(maps)} changes"
+
+
+SYNC_METHODS = [   # (group, key, label, note, ready) — decision 24: Automatic first, Fine-tune last
+    ("AUTOMATIC", "auto_sub",   "To another subtitle", "any lang.",    True),
+    ("AUTOMATIC", "auto_video", "To the video",        "audio",        True),
+    ("AUTOMATIC", "auto_track", "Track in a video",    "MKV / MP4",    True),
+    ("CHECK",     "check",      "Check sync",          "status only",  True),
+    ("CHECK",     "folder",     "Check a folder…",     "report",       True),
+    ("FINE-TUNE", "shift",      "Shift",               "offset",       True),
+    ("FINE-TUNE", "scale",      "Frame rate",          "speed",        True),
+    ("FINE-TUNE", "two_point",  "Two points",          "offset + speed", True),
+]
+SYNC_METHOD_NAMES = {"shift": "Shift", "scale": "Frame rate", "two_point": "Two points",
+                     "piecewise": "Piecewise", "auto_sub": "To another subtitle", "auto_video": "To the video"}
+SYNC_FACTS = [("offset", "Offset"), ("speed", "Speed"), ("cuts", "Cuts"), ("match", "Match → after"),
+              ("unmatched", "Unmatched")]
+TIMELINE_SPAN_MS = 120_000
+
+
+def reference_candidates(path) -> list:
+    """Other subtitles of the same film next to this one: the same name once the language tag is removed
+    (Movie.pt.srt for Movie.en.srt). Used as the reference for the check on load."""
+    p = Path(path)
+    base = strip_language_tag(p.stem).lower()
+    try:
+        files = sorted(p.parent.iterdir())
+    except OSError:
+        return []
+    return [str(q) for q in files if q.is_file() and q.suffix.lower() in TEXT_FORMATS
+            and not same_file(str(q), str(p)) and strip_language_tag(q.stem).lower() == base]
+
+
+VIDEO_EXTS = (".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2ts", ".wmv", ".mpg", ".mpeg")
+
+
+def video_candidates(path) -> list:
+    """Videos next to a subtitle with the same name once the language tag is removed (Movie.mkv for
+    Movie.en.srt), then any other video in the folder when there is exactly one."""
+    p = Path(path)
+    base = strip_language_tag(p.stem).lower()
+    try:
+        vids = [q for q in sorted(p.parent.iterdir()) if q.is_file() and q.suffix.lower() in VIDEO_EXTS]
+    except OSError:
+        return []
+    same = [str(q) for q in vids if q.stem.lower() == base]
+    return same or ([str(vids[0])] if len(vids) == 1 else [])
+
+
+def audio_track_label(stream: dict, k: int) -> str:
+    lang = language_name(stream.get("language") or "") or (stream.get("language") or "no language tag")
+    ch = f", {stream['channels']} ch" if stream.get("channels") else ""
+    title = f" — {stream['title']}" if stream.get("title") else ""
+    return f"Track {k + 1}: {lang} ({stream.get('codec') or '?'}{ch}){title}"
+
+
+_LANG3 = {"eng": "en", "por": "pt", "spa": "es", "fre": "fr", "fra": "fr", "ger": "de", "deu": "de", "ita": "it",
+          "jpn": "ja", "chi": "zh", "zho": "zh", "kor": "ko", "rus": "ru", "tha": "th", "ara": "ar", "heb": "he",
+          "pol": "pl", "tur": "tr", "dut": "nl", "nld": "nl", "swe": "sv", "dan": "da", "nor": "no", "fin": "fi",
+          "cze": "cs", "ces": "cs", "gre": "el", "ell": "el", "hun": "hu", "rum": "ro", "ron": "ro", "ukr": "uk",
+          "vie": "vi", "ind": "id", "hin": "hi", "bul": "bg", "hrv": "hr", "srp": "sr", "slv": "sl", "slk": "sk",
+          "slo": "sk", "est": "et", "lav": "lv", "lit": "lt", "may": "ms", "msa": "ms", "fil": "tl",
+          "mac": "mk", "mkd": "mk", "nob": "nb", "nno": "nn", "ice": "is", "isl": "is", "cat": "ca", "baq": "eu",
+          "eus": "eu", "glg": "gl", "per": "fa", "fas": "fa", "alb": "sq", "sqi": "sq", "bos": "bs", "geo": "ka",
+          "kat": "ka", "arm": "hy", "hye": "hy", "ben": "bn", "tam": "ta", "tel": "te", "urd": "ur", "wel": "cy",
+          "cym": "cy", "gle": "ga", "lat": "la", "bel": "be", "kaz": "kk", "aze": "az", "uzb": "uz", "mon": "mn",
+          "khm": "km", "lao": "lo", "mya": "my", "bur": "my", "swa": "sw", "afr": "af", "amh": "am", "tgl": "tl",
+          "mal": "ml", "kan": "kn", "mar": "mr", "guj": "gu", "pan": "pa", "nep": "ne", "sin": "si"}
+# names of languages that are not in the app's translation list (subtitle tracks may be in any of them)
+_LANG_EXTRA = {"bg": "Bulgarian", "hr": "Croatian", "sr": "Serbian", "sl": "Slovenian", "sk": "Slovak",
+               "et": "Estonian", "lv": "Latvian", "lt": "Lithuanian", "ms": "Malay", "tl": "Filipino",
+               "mk": "Macedonian", "no": "Norwegian", "nn": "Norwegian", "is": "Icelandic", "ca": "Catalan",
+               "eu": "Basque", "gl": "Galician", "fa": "Persian", "sq": "Albanian", "bs": "Bosnian",
+               "ka": "Georgian", "hy": "Armenian", "bn": "Bengali", "ta": "Tamil", "te": "Telugu", "ur": "Urdu",
+               "cy": "Welsh", "ga": "Irish", "la": "Latin", "be": "Belarusian", "kk": "Kazakh", "az": "Azerbaijani",
+               "uz": "Uzbek", "mn": "Mongolian", "km": "Khmer", "lo": "Lao", "my": "Burmese", "sw": "Swahili",
+               "af": "Afrikaans", "am": "Amharic", "ml": "Malayalam", "kn": "Kannada", "mr": "Marathi",
+               "gu": "Gujarati", "pa": "Punjabi", "ne": "Nepali", "si": "Sinhala"}
+
+
+def default_audio_track(streams: list, lang_code: str) -> int:
+    """Index (into the audio list) of the track in the subtitle's language, else the default one, else the first."""
+    want = (lang_code or "").split("-")[0].lower()
+    for k, st_ in enumerate(streams):
+        if want and _LANG3.get(st_.get("language", ""), st_.get("language", "")[:2]) == want:
+            return k
+    for k, st_ in enumerate(streams):
+        if st_.get("default"):
+            return k
+    return 0
+
+
+def language_name(code: str) -> str:
+    """'en' / 'eng' / 'en-US' → 'English'; '' when unknown."""
+    c = (code or "").lower()
+    c = _LANG3.get(c, c)
+    for full, label in _LANG_LABEL.items():
+        if full.lower() == c or full.split("-")[0].lower() == c:
+            return label.split(" — ")[0].split(" (")[0]
+    return _LANG_EXTRA.get(c.split("-")[0], "")
+
+
+def track_lang2(track: dict) -> str:
+    code = track.get("language") or ""
+    return _LANG3.get(code, code[:2] if len(code) == 2 else "")
+
+
+def best_track(tracks: list, lang_code: str) -> int:
+    """Position (in tracks) of the text track to preselect: the subtitle language first (not forced, not SDH, most
+    lines), then the default track, then the first text track; -1 if there is none."""
+    text = [k for k, t in enumerate(tracks) if t["text"]]
+    if not text:
+        return -1
+    want = (lang_code or "").split("-")[0].lower()
+    same = [k for k in text if want and track_lang2(tracks[k]) == want]
+    if same:
+        return max(same, key=lambda k: (not tracks[k]["forced"], not tracks[k]["sdh"], tracks[k].get("lines", 0)))
+    dflt = [k for k in text if tracks[k]["default"] and not tracks[k]["forced"]]
+    return dflt[0] if dflt else text[0]
+
+
+def track_display(video: str, track: dict) -> str:
+    lang = language_name(track.get("language", "")) or track.get("language") or "no language tag"
+    return f"{Path(video).name} · track {track['n']} ({lang})"
+
+
+def track_virtual_path(video: str, track: dict) -> str:
+    """Where the track 'lives' for naming: next to the video as Movie.en.srt (Movie.en.ass for ASS)."""
+    v = Path(video)
+    tag = track_lang2(track) or f"track{track['n']}"
+    return str(v.with_name(f"{v.stem}.{tag}{track['ext'] or '.srt'}"))
+
+
+def sync_check_chip(res, ref_name: str) -> tuple:
+    """(chip text, chip kind) for the SOURCE card: '⚠ −1.0 s vs Movie.pt.srt' (how far off it is now)."""
+    short = middle_ellipsis(ref_name, 26)
+    s = res.status
+    if s == "in_sync":
+        return f"✓ in sync with {short}", "ok"
+    if s == "cannot_tell":
+        return f"? cannot tell vs {short}", ""
+    if s == "cut":
+        return f"⛔ different cut vs {short}", "bad"
+    if s == "uneven":
+        return f"⚠ uneven vs {short}", "warn"
+    if s in ("drift", "offset_drift"):
+        return f"⚠ {srt_sync.describe_ratio(res.ratio)} vs {short}", "warn"
+    off = -res.offset_ms / 1000
+    return f"⚠ {'+' if off > 0 else '−'}{abs(off):.1f} s vs {short}", "warn"
+
+
+def folder_check_rows(reference_blocks, paths, progress=None, cancel=None) -> list:
+    """Check a folder: every subtitle against one reference. [{file, status, text, res, error}]"""
+    rows = []
+    for k, path in enumerate(paths):
+        if progress:
+            progress(k, len(paths), Path(path).name)
+        if cancel and cancel():
+            raise srt_sync.Cancelled()
+        try:
+            doc = load_subtitle(path)
+            res = srt_sync.match_blocks(reference_blocks, doc.blocks, cancel=cancel)
+            rows.append({"file": path, "status": res.status, "text": res.status_text(), "res": res, "error": ""})
+        except srt_sync.Cancelled:
+            raise
+        except Exception as e:      # one unreadable file must not stop the folder
+            rows.append({"file": path, "status": "error", "text": str(e)[:120], "res": None, "error": str(e)})
+    return rows
+
+
+def folder_report_text(reference: str, rows: list) -> str:
+    L = ["SRT Studio — sync check of a folder", "=" * 40, f"Reference: {reference}",
+         f"Date:      {datetime.now().strftime('%Y-%m-%d %H:%M')}   ({APP_TITLE})", "",
+         "| File | Status | Offset | Speed | Parts | Confidence | Overlap before → after |",
+         "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        res = r["res"]
+        if res is None:
+            L.append(f"| {Path(r['file']).name} | cannot read: {r['text']} | | | | | |")
+            continue
+        L.append(f"| {Path(r['file']).name} | {res.status_text()} | {srt_sync.fmt_offset(res.offset_ms)} | "
+                 f"{srt_sync.describe_ratio(res.ratio)} | {len(res.segments)} | {res.confidence:.2f} | "
+                 f"{res.overlap_before:.2f} → {res.overlap_after:.2f} |")
+    L += ["", "Offset = the shift that fixes the file (+ = later). Nothing was changed."]
+    return "\n".join(L) + "\n"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2173,7 +2463,7 @@ Left side      The job: SOURCE (file, format, encoding, blocks,
                ENGINE (provider and model), OPTIONS (summary and
                Edit…), then the estimated cost and Start / Sample /
                Cancel.
-Right side     Subtitles, Names and Log tabs (Ctrl+1, 2, 3).
+Right side     Subtitles, Names, Sync and Log tabs (Ctrl+1, 2, 3, 4).
 Divider        Drag the divider between the two sides to make either
                side wider; when the window is resized both sides keep
                their proportion. Double-click the divider (or
@@ -2182,8 +2472,110 @@ Divider        Drag the divider between the two sides to make either
 Status bar     What is happening, the progress bar, the last cost and
                an "Open folder" link after a saved run.
 Keyboard       Ctrl+O open · Ctrl+Enter start · Esc cancel a run ·
-               Ctrl+1/2/3 tabs · Ctrl+S save the log (Log tab) ·
+               Ctrl+1/2/3/4 tabs · Ctrl+S save the log (Log tab) ·
                F1 this Help.
+
+NEW IN v0.10.0
+--------------
+Sync tab       Fixes the timing of a subtitle. Methods on the left:
+               AUTOMATIC first (to another subtitle, to the video,
+               to a track inside a video), then CHECK, then
+               FINE-TUNE (by hand). The result is one sentence, the
+               key numbers (offset, speed, cuts), a preview of the
+               old and new times and a picture of the timing.
+To another     Choose a reference: a subtitle of the same film that is
+subtitle       in sync with your video, in any language (only the
+               timing is compared: when text is on screen). Analyse
+               finds the offset, a frame-rate difference and cuts
+               (another version of the film, with scenes added or
+               removed). The result is one sentence with Fix it, the
+               key numbers, a preview with the reference line next to
+               each line, and the timeline (reference, now, after).
+               Confidence below 0.5: check the preview first; the app
+               asks before it applies. "? Cannot tell" (e.g. another
+               film) changes nothing.
+To the video   Choose the video (the one next to the subtitle with the
+               same name is suggested) and its audio track (the one in
+               the subtitle's language). The app finds where people
+               speak (in the centre channel of 5.1 sound, where film
+               dialogue is) and matches the subtitle to it: offset,
+               frame rate, cuts and uneven timing, as above. Reading
+               the audio takes about 20–60 s for a film and is kept
+               for the next time. Long stretches of speech with no
+               subtitle are listed in the report (a scene that is not
+               in the subtitle's version). Music and noise lower the
+               confidence. The audio finds offset and speed
+               reliably; cuts (another version of the film) only
+               sometimes: for those, sync to a subtitle of the same
+               version as your video.
+Reference      With a video next to the subtitle, "Check the reference
+check          against the video's audio" (To another subtitle) tells
+               whether the reference itself is in sync before you
+               trust it.
+Track in a     Use a subtitle inside a video (MKV, MP4…) as the
+video          reference: pick one of its text tracks.
+Check sync     The same comparison, status only: ✅ In sync ·
+               ⚠ Constant offset · ⚠ Speed drift · ⚠ Offset and drift
+               · ⚠ Uneven timing · ⛔ Different cut · ? Cannot tell.
+               Fix it… opens the sync with the result. SOURCE shows
+               the status, e.g. "⚠ +2.5 s vs Movie.pt.srt" (+ = the
+               subtitle is late now).
+Check on load  When a subtitle is opened, it is compared with the
+               context file or with another subtitle of the same film
+               next to it (Movie.pt.srt for Movie.en.srt). It only
+               reports. Settings → Output → SYNC CHECK turns it off.
+Check a folder Every subtitle in a folder is compared with the loaded
+               one; one table with the status of each, Copy report and
+               Save report… Nothing is changed.
+From video…    Open a video (toolbar From video…, Open…, Recent or drag
+               and drop: MKV, MP4, M4V, MOV, WEBM, AVI). Its subtitle
+               tracks are listed with language, title, format, flags
+               (default, forced, SDH) and the number of lines; the one
+               in the source language is picked. Picture tracks (PGS,
+               VobSub) are listed but need text recognition (OCR),
+               which is not supported. Load and translate (SOURCE shows
+               "from MKV · track 3"; the translation is saved next to
+               the video as Movie.pt-BR.srt), Use as sync reference, or
+               Save as file… (Movie.en.srt; ASS tracks stay ASS with
+               their styles). The video itself is never changed.
+Video tools    Sync to the video and subtitles inside MKV/MP4 need
+(FFmpeg)       FFmpeg, the free video toolkit (LGPL). It is not part
+               of the app: the first time it is needed the app offers
+               to download it (about 81 MB, once, into
+               ~/.srt_studio/tools/ffmpeg) or to use an ffmpeg.exe you
+               already have. Settings → General → VIDEO TOOLS shows
+               which one is used (the file chosen there, then the
+               download, then the PATH).
+Shift          Moves every line by the same amount. Subtitles that
+               appear too late need a negative value (−2.35 or
+               00:00:02,350); the −1 s … +1 s buttons nudge it.
+Frame rate     For a subtitle that drifts more and more: it was made
+               for another frame rate (PAL 25 fps against film
+               23.976 fps). Pick a preset or type both rates.
+Two points     Type when a line near the start and one near the end
+               are really spoken: offset and speed are fixed together.
+Hints          With nothing to compare against, the tab looks at the
+               subtitle alone (a first line unusually late or early,
+               lines after the end of the video) and offers Try it,
+               which fills in Fine-tune.
+Apply / Undo   Apply gives the loaded subtitle the new times (in the
+               app only; a translation started afterwards uses them).
+               A second Apply goes on top of the first. Undo sync
+               brings back the times the file had when it was opened.
+               SOURCE shows "Sync ✓ synced: +2.350 s"; the Subtitles
+               table can show only the moved lines (Synced).
+Save synced    Writes the synced subtitle, in its own format (ASS
+copy           styles, comments and drawings move with it). Saving
+               over the original writes <name>.bak first; an older
+               .bak is never replaced (.bak2, .bak3…).
+               To sync a subtitle that is already translated, open it
+               as the source, sync it and Save synced copy: no
+               translation is needed.
+Sync report    Every applied sync has a report: file, method, offset
+               and speed, blocks moved, blocks clamped at 0:00 or
+               dropped (they ended before the film starts), a before
+               and after sample, the output and backup files.
+               Report… shows it, with Copy and Save as .txt.
 
 NEW IN v0.9.1
 -------------
@@ -2692,6 +3084,7 @@ class App(tk.Tk):
         self.problems          = []
         self._repair_log       = []
         self.input_path        = ""
+        self._origin           = None      # v0.10.0 (S5): {"video", "track", "label"} for a track from a video
         self.context_path      = ""
         self.output_path       = ""
         self._last_saved       = ""
@@ -2725,6 +3118,8 @@ class App(tk.Tk):
         self.sample_from    = tk.StringVar(value=cfg.get("sample_from", "middle"))
         self.dark_title     = tk.BooleanVar(value=cfg.get("dark_title_bar", True))          # v0.9.1 (X6)
         self.check_updates  = tk.BooleanVar(value=cfg.get("check_updates", False))          # v0.9.1 (X11)
+        self.sync_check_on_load = tk.BooleanVar(value=cfg.get("sync_check_on_load", True))  # v0.10.0 (S2)
+        self._ffmpeg_path   = cfg.get("ffmpeg_path", "")                                     # v0.10.0 (S3)
         self._last_update_check = cfg.get("last_update_check", "")
         self._skipped_version   = cfg.get("skipped_version", "")
         self._cols_user     = False      # v0.9.1 (X7): the user dragged a column edge for this file
@@ -2861,6 +3256,8 @@ class App(tk.Tk):
             "sample_from":       self.sample_from.get(),
             "dark_title_bar":    self.dark_title.get(),
             "check_updates":     self.check_updates.get(),
+            "sync_check_on_load": self.sync_check_on_load.get(),
+            "ffmpeg_path":       self._ffmpeg_path,
             "last_update_check": self._last_update_check,
             "skipped_version":   self._skipped_version,
             "recent_files":      self._recent,
@@ -3020,6 +3417,9 @@ class App(tk.Tk):
                                     postcommand=self._fill_recent_menu)
         self._recent_btn.configure(menu=self._recent_menu)
         self._recent_btn.pack(side="left", padx=(6, 0))
+        fv = self._flat_btn(bar, "From video…", self._from_video, padx=12, pady=3, bg=C["bg_card"])
+        fv.pack(side="left", padx=(6, 0))
+        Tooltip(fv, "Take a subtitle that is inside a video (MKV, MP4…): translate it, sync to it or save it")
         # v0.9.1 (X5): Help ▾ menu (Help, engines, updates, About), like Recent ▾
         help_btn = tk.Menubutton(bar, text="?  Help ▾", font=FONTS["small"], bg=C["bg_card"], fg=C["text"],
                                  activebackground=C["border"], activeforeground=C["text_bright"],
@@ -3070,6 +3470,13 @@ class App(tk.Tk):
             tk.Label(r, text=label, width=8, anchor="w", font=FONTS["tiny"], fg=C["text_dim"],
                      bg=C["bg_card"]).pack(side="left")
             return r
+        self._sync_row = stat_row("Sync")             # v0.10.0 (S1)
+        self._sync_row_chip = self._chip(self._sync_row, "not checked")
+        self._sync_row_chip.pack(side="left")
+        self._sync_row_link = self._link(self._sync_row, "Sync…", self._open_sync_tab)
+        self._sync_row_link.pack(side="right")
+        Tooltip(self._sync_row, "Timing of the subtitle: check it against another subtitle or the video, or fix\n"
+                                "it by hand (Shift, Frame rate, Two points) on the Sync tab.")
         self._repair_row = stat_row("Repair")
         self._repair_chip = self._chip(self._repair_row)
         self._repair_chip.pack(side="left")
@@ -3268,7 +3675,7 @@ class App(tk.Tk):
         nb = ttk.Notebook(parent, style="T.TNotebook")
         nb.pack(fill="both", expand=True)
         self.notebook = nb
-        self.TAB_SUBS, self.TAB_NAMES, self.TAB_LOG = 0, 1, 2
+        self.TAB_SUBS, self.TAB_NAMES, self.TAB_SYNC, self.TAB_LOG = 0, 1, 2, 3
         self.TAB_COMPARE = self.TAB_PREVIEW = self.TAB_SUBS        # names used before v0.9.0
 
         t1 = tk.Frame(nb, bg=C["bg_card"])
@@ -3277,16 +3684,19 @@ class App(tk.Tk):
         t2 = tk.Frame(nb, bg=C["bg_card"])
         nb.add(t2, text="  Names  ")
         self._build_names_tab(t2)
+        ts = tk.Frame(nb, bg=C["bg_card"])
+        nb.add(ts, text="  Sync  ")
+        self._build_sync_tab(ts)
         t3 = tk.Frame(nb, bg=C["bg_card"])
         nb.add(t3, text="  Log  ")
         self._build_log_tab(t3)
         tab = (self._cfg.get("window") or {}).get("tab") if isinstance(self._cfg.get("window"), dict) else None
-        if tab in ("names", "log"):
-            nb.select({"names": 1, "log": 2}[tab])
+        if tab in ("names", "sync", "log"):
+            nb.select({"names": 1, "sync": 2, "log": 3}[tab])
 
     def _current_tab_name(self) -> str:
         try:
-            return ["subtitles", "names", "log"][self.notebook.index(self.notebook.select())]
+            return ["subtitles", "names", "sync", "log"][self.notebook.index(self.notebook.select())]
         except Exception:
             return "subtitles"
 
@@ -3319,7 +3729,7 @@ class App(tk.Tk):
         bar.pack(fill="x", padx=self.px(12), pady=(self.px(8), self.px(6)))
         tk.Label(bar, text="Show", font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"]).pack(side="left", padx=(0, 6))
         self._filter_btns = {}
-        for key in ("all", "flagged", "repaired"):
+        for key in ("all", "flagged", "repaired", "synced"):
             b = tk.Label(bar, text=key, font=FONTS["tiny"], padx=9, pady=1, cursor="hand2",
                          highlightthickness=1)
             b.pack(side="left", padx=(0, 6))
@@ -3428,7 +3838,9 @@ class App(tk.Tk):
         n_all = len(self.source_blocks)
         n_flag = len(self._flags)
         n_rep = sum(1 for b in self.source_blocks if b.get("_repaired"))
-        labels = {"all": f"All {n_all:,}", "flagged": f"Flagged {n_flag}", "repaired": f"Repaired {n_rep}"}
+        n_syn = sum(1 for b in self.source_blocks if b.get("_synced"))
+        labels = {"all": f"All {n_all:,}", "flagged": f"Flagged {n_flag}", "repaired": f"Repaired {n_rep}",
+                  "synced": f"Synced {n_syn:,}"}
         for key, b in self._filter_btns.items():
             on = self._filter.get() == key
             b.configure(text=labels[key], fg=C["chip_sel_fg"] if on else C["text"],
@@ -3461,6 +3873,8 @@ class App(tk.Tk):
                 continue
             if f == "repaired" and not b.get("_repaired"):
                 continue
+            if f == "synced" and not b.get("_synced"):
+                continue
             vals = self._row_values(i, b)
             if q and q not in " ".join(vals).lower():
                 continue
@@ -3486,7 +3900,8 @@ class App(tk.Tk):
         b = self.source_blocks[i]
         flags = ", ".join(self._flags.get(i, []))
         self._detail_meta.configure(text=f"#{b['id']}   {b['timestamp']}" + (f"    ⚠ {flags}" if flags else "")
-                                    + ("    repaired" if b.get("_repaired") else ""),
+                                    + ("    repaired" if b.get("_repaired") else "")
+                                    + ("    synced" if b.get("_synced") else ""),
                                     fg=COLORS["warning"] if flags else COLORS["text_dim"])
         t.insert("end", "\n".join(b["text_lines"]) + "\n")
         if i in self._tr_lines:
@@ -3652,6 +4067,1705 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
+    # SYNC TAB (v0.10.0 · S1) ───────────────────────────────────────
+    def _build_sync_tab(self, t):
+        C = COLORS
+        self._sync_method = "shift"
+        self._sync_snapshot = None       # the loaded blocks before the first Apply (Undo sync restores them)
+        self._sync_info = None           # report info of the last Apply
+        self._sync_pending = None        # (TimeMap, SyncResult) for the values typed in the method panel
+        self._sync_error = ""
+        self._video_ms = None            # the video's length, when known (hints); filled by S3/S4
+        self._video_fps = None
+        self._auto = None                # v0.10.0 (S2): last automatic result {res, ref_path, ref_blocks, blocks}
+        self._sync_check = None          # (MatchResult, reference name) for the SOURCE card
+        self._sync_job = None            # token of the running analysis
+        self._sync_cancel = False
+        self._ref_path = ""
+        self._detect_cuts = tk.BooleanVar(value=True)
+        self._video_path = ""            # v0.10.0 (S4)
+        self._video_probe = None
+        self._audio_streams = []
+
+        left = tk.Frame(t, bg=C["bg_card"], width=self.px(196))
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+        tk.Frame(t, bg=C["border"], width=1).pack(side="left", fill="y")
+        self._sync_items = {}
+        group = None
+        for grp, key, label, note, ready in SYNC_METHODS:
+            if grp != group:
+                tk.Label(left, text=grp, font=FONTS["badge"], fg=C["text_dim"], bg=C["bg_card"],
+                         anchor="w").pack(fill="x", padx=self.px(14), pady=(self.px(14 if group else 10), 2))
+                group = grp
+            row = tk.Frame(left, bg=C["bg_card"], cursor="hand2")
+            row.pack(fill="x", padx=self.px(6), pady=1)
+            a = tk.Label(row, text=label, font=FONTS["small"], anchor="w", bg=C["bg_card"], padx=8, pady=4,
+                         cursor="hand2")
+            a.pack(side="left")
+            b = tk.Label(row, text=note if ready else "coming", font=FONTS["tiny"], bg=C["bg_card"],
+                         fg=C["text_dim"], cursor="hand2")
+            b.pack(side="right", padx=(0, 8))
+            for w in (row, a, b):
+                w.bind("<Button-1>", lambda e, k=key: self._select_sync_method(k))
+            self._sync_items[key] = (row, a, b, ready)
+
+        main = tk.Frame(t, bg=C["bg_card"])
+        main.pack(side="left", fill="both", expand=True, padx=self.px(14), pady=(self.px(12), self.px(10)))
+        self._sync_main = main
+
+        # bottom first, so the buttons and the timeline always show
+        bar = tk.Frame(main, bg=C["bg_card"])
+        bar.pack(side="bottom", fill="x", pady=(self.px(10), 0))
+        self._sync_apply_btn = self._flat_btn(bar, "Apply", self._sync_apply, primary=True, padx=18, pady=5)
+        self._sync_apply_btn.pack(side="right")
+        Tooltip(self._sync_apply_btn, "Give the loaded subtitle these times. The file on disk is not changed;\n"
+                                      "a translation started afterwards uses the new times.")
+        self._sync_save_btn = self._flat_btn(bar, "Save synced copy…", self._sync_save_copy, padx=12, pady=5)
+        self._sync_save_btn.pack(side="right", padx=(0, 6))
+        Tooltip(self._sync_save_btn, "Write the synced subtitle to a file. Overwriting the original first\n"
+                                     "writes <name>.bak (an older .bak is never replaced).")
+        self._sync_report_btn = self._flat_btn(bar, "Report…", self._show_sync_report, padx=12, pady=5)
+        self._sync_report_btn.pack(side="right", padx=(0, 6))
+        self._sync_undo_btn = self._flat_btn(bar, "Undo sync", self._sync_undo, dim=True, padx=12, pady=5)
+        self._sync_undo_btn.pack(side="left")
+        Tooltip(self._sync_undo_btn, "Restore the times the subtitle had when it was opened")
+
+        tl = tk.Frame(main, bg=C["bg_card"])
+        tl.pack(side="bottom", fill="x", pady=(self.px(10), 0))
+        self._timeline = tk.Canvas(tl, height=self.px(74), bg=C["timeline_bg"], highlightthickness=1,
+                                   highlightbackground=C["border"], bd=0)
+        self._timeline.pack(fill="x")
+        self._timeline.bind("<Configure>", lambda e: self._draw_timeline())
+
+        # verdict: one sentence, a sub-line and (for automatic results and hints) one button
+        v = tk.Frame(main, bg=C["bg_input"], highlightthickness=1, highlightbackground=C["border"])
+        v.pack(fill="x")
+        v.columnconfigure(0, weight=1)
+        self._sv_box = v
+        self._sv_title = tk.Label(v, text="", font=FONTS["heading"], anchor="w", justify="left", bg=C["bg_input"])
+        self._sv_title.grid(row=0, column=0, sticky="ew", padx=(12, 8), pady=(9, 0))
+        self._sv_sub = tk.Label(v, text="", font=FONTS["small"], anchor="w", justify="left", bg=C["bg_input"])
+        self._sv_sub.grid(row=1, column=0, sticky="ew", padx=(12, 8), pady=(1, 9))
+        self._sv_hints = tk.Frame(v, bg=C["bg_input"])
+        self._sv_btn = self._flat_btn(v, "", None, primary=True, padx=16, pady=6)
+        v.bind("<Configure>", lambda e: self._wrap_verdict())
+
+        facts = tk.Frame(main, bg=C["bg_card"])
+        facts.pack(fill="x", pady=(self.px(10), 0))
+        self._facts = {}
+        for i, (k, label) in enumerate(SYNC_FACTS):
+            f = tk.Frame(facts, bg=C["bg_input"], highlightbackground=C["border"], highlightthickness=1)
+            f.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else self.px(8), 0))
+            facts.columnconfigure(i, weight=1, uniform="facts")
+            tk.Label(f, text=label, font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_input"],
+                     anchor="w").pack(fill="x", padx=10, pady=(5, 0))
+            val = tk.Label(f, text="—", font=FONTS["mono"], fg=C["text"], bg=C["bg_input"], anchor="w")
+            val.pack(fill="x", padx=10, pady=(0, 5))
+            self._facts[k] = val
+
+        self._sync_panel_host = tk.Frame(main, bg=C["bg_card"])
+        self._sync_panel_host.pack(fill="x", pady=(self.px(12), 0))
+        self._sync_panels = {"shift": self._build_shift_panel(self._sync_panel_host),
+                             "scale": self._build_scale_panel(self._sync_panel_host),
+                             "two_point": self._build_two_point_panel(self._sync_panel_host),
+                             "auto": self._build_auto_panel(self._sync_panel_host),
+                             "video": self._build_video_panel(self._sync_panel_host),
+                             "track": self._build_track_panel(self._sync_panel_host),
+                             "folder": self._build_folder_panel(self._sync_panel_host),
+                             "later": self._build_later_panel(self._sync_panel_host)}
+
+        pv = tk.Frame(main, bg=C["bg_card"])
+        pv.pack(fill="both", expand=True, pady=(self.px(10), 0))
+        self._sync_preview_frame = pv
+        cols = ("num", "old", "new", "text", "ref")
+        self._sync_tree = ttk.Treeview(pv, columns=cols, show="headings", style="Subs.Treeview",
+                                       selectmode="none", height=6)
+        for c, w, txt in (("num", 54, "#"), ("old", 112, "Now"), ("new", 112, "After"), ("text", 300, "Text"),
+                          ("ref", 260, "Reference at that time")):
+            self._sync_tree.heading(c, text=txt, anchor="w")
+            self._sync_tree.column(c, width=self.px(w), stretch=c in ("text", "ref"), anchor="w",
+                                   minwidth=self.px(30))
+        sb = ttk.Scrollbar(pv, orient="vertical", command=self._sync_tree.yview, style="D.Vertical.TScrollbar")
+        self._sync_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._sync_tree.pack(side="left", fill="both", expand=True)
+        self._sync_tree.tag_configure("moved", foreground=C["warning"])
+        self._sync_tree.tag_configure("gap", foreground=C["text_dim"])
+        self._sync_tree.tag_configure("dropped", foreground=C["error"])
+        self._select_sync_method("shift")
+
+    def _sync_entry(self, parent, var, width=12):
+        C = COLORS
+        e = tk.Entry(parent, textvariable=var, font=FONTS["mono"], width=width, bg=C["bg_input"], fg=C["text"],
+                     insertbackground=C["text"], relief="flat", highlightbackground=C["border"],
+                     highlightcolor=C["accent"], highlightthickness=1)
+        return e
+
+    def _panel_help(self, parent, text):
+        lbl = tk.Label(parent, text=text, font=FONTS["tiny"], fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w",
+                       justify="left")
+        lbl.bind("<Configure>", lambda e: lbl.configure(wraplength=max(200, e.width - 4)))
+        return lbl
+
+    def _build_shift_panel(self, host):
+        C = COLORS
+        p = tk.Frame(host, bg=C["bg_card"])
+        row = tk.Frame(p, bg=C["bg_card"])
+        row.pack(fill="x")
+        tk.Label(row, text="Offset", font=FONTS["small"], fg=C["text"], bg=C["bg_card"]).pack(side="left")
+        self._sh_var = tk.StringVar(value="0.000")
+        e = self._sync_entry(row, self._sh_var, 12)
+        e.pack(side="left", padx=(8, 4), ipady=2)
+        self._sh_entry = e
+        tk.Label(row, text="s", font=FONTS["small"], fg=C["text_dim"], bg=C["bg_card"]).pack(side="left")
+        for label, d in (("−1 s", -1000), ("−0.1 s", -100), ("+0.1 s", 100), ("+1 s", 1000)):
+            self._flat_btn(row, label, lambda d=d: self._nudge_shift(d), font=FONTS["tiny"], padx=9,
+                           pady=2).pack(side="left", padx=(6 if label == "−1 s" else 4, 0))
+        self._sh_var.trace_add("write", lambda *_: self._sync_recompute())
+        self._panel_help(p, "Subtitles appear too late → negative value; too early → positive. Seconds (−2.35) "
+                            "or a time (00:00:02,350).").pack(fill="x", pady=(6, 0))
+        return p
+
+    def _nudge_shift(self, delta_ms):
+        try:
+            cur = srt_sync.to_ms(self._sh_var.get() or "0")
+        except ValueError:
+            cur = 0
+        self._sh_var.set(srt_sync.fmt_seconds(cur + delta_ms))
+
+    def _build_scale_panel(self, host):
+        C = COLORS
+        p = tk.Frame(host, bg=C["bg_card"])
+        row = tk.Frame(p, bg=C["bg_card"])
+        row.pack(fill="x")
+        values = ["23.976", "24", "25", "29.97", "30"]
+        tk.Label(row, text="Subtitle made for", font=FONTS["small"], fg=C["text"], bg=C["bg_card"]).pack(side="left")
+        self._fr_from = tk.StringVar(value="25")
+        self._fr_to = tk.StringVar(value="25")
+        for var, lbl in ((self._fr_from, None), (self._fr_to, "fps  →  video")):
+            if lbl:
+                tk.Label(row, text=lbl, font=FONTS["small"], fg=C["text"], bg=C["bg_card"]).pack(side="left",
+                                                                                                padx=(6, 0))
+            cb = ttk.Combobox(row, textvariable=var, values=values, width=8, style="Lang.TCombobox",
+                              font=FONTS["mono"])
+            cb.pack(side="left", padx=(8, 0))
+            _no_wheel(cb)
+            var.trace_add("write", lambda *_: self._sync_recompute())
+        tk.Label(row, text="fps", font=FONTS["small"], fg=C["text"], bg=C["bg_card"]).pack(side="left", padx=(6, 0))
+        pr = tk.Frame(p, bg=C["bg_card"])
+        pr.pack(fill="x", pady=(8, 0))
+        tk.Label(pr, text="Presets", font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"]).pack(side="left",
+                                                                                                padx=(0, 4))
+        for f, to in srt_sync.FPS_PRESETS:
+            chip = tk.Label(pr, text=f"{f:g} → {to:g}", font=FONTS["tiny"], fg=C["text"], bg=C["bg_input"],
+                            padx=7, cursor="hand2", highlightthickness=1, highlightbackground=C["border"])
+            chip.pack(side="left", padx=(4, 0))
+            chip.bind("<Button-1>", lambda e, f=f, to=to: (self._fr_from.set(f"{f:g}"), self._fr_to.set(f"{to:g}")))
+        self._panel_help(p, "For a subtitle that drifts more and more: it was timed for another frame rate "
+                            "(PAL 25 fps against film 23.976 fps). Times are scaled from 0:00.").pack(
+            fill="x", pady=(6, 0))
+        return p
+
+    def _build_two_point_panel(self, host):
+        C = COLORS
+        p = tk.Frame(host, bg=C["bg_card"])
+        g = tk.Frame(p, bg=C["bg_card"])
+        g.pack(fill="x")
+        for col, txt in enumerate(("", "Block #", "Now", "Correct time", "")):
+            tk.Label(g, text=txt, font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"],
+                     anchor="w").grid(row=0, column=col, sticky="w", padx=(0, 10))
+        self._tp = {}
+        for r, key in ((1, "a"), (2, "b")):
+            blk, correct = tk.StringVar(), tk.StringVar()
+            tk.Label(g, text="A" if key == "a" else "B", font=FONTS["small"], fg=C["accent_soft"],
+                     bg=C["bg_card"]).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=2)
+            eb = self._sync_entry(g, blk, 7)
+            eb.grid(row=r, column=1, sticky="w", padx=(0, 10), pady=2, ipady=1)
+            now = tk.Label(g, text="", font=FONTS["mono"], fg=C["text"], bg=C["bg_card"], anchor="w")
+            now.grid(row=r, column=2, sticky="w", padx=(0, 10))
+            ec = self._sync_entry(g, correct, 14)
+            ec.grid(row=r, column=3, sticky="w", padx=(0, 10), pady=2, ipady=1)
+            words = tk.Label(g, text="", font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"], anchor="w")
+            words.grid(row=r, column=4, sticky="w")
+            self._tp[key] = {"block": blk, "correct": correct, "now": now, "words": words, "entry": ec}
+            blk.trace_add("write", lambda *_, k=key: self._tp_block_changed(k))
+            correct.trace_add("write", lambda *_: self._sync_recompute())
+        self._panel_help(p, "Pick a line near the start and one near the end, and type when each is really "
+                            "spoken (HH:MM:SS,mmm or seconds). Fixes offset and speed together.").pack(
+            fill="x", pady=(6, 0))
+        return p
+
+    def _build_auto_panel(self, host):
+        """To another subtitle / Check sync: the reference, Analyse, progress and Cancel (v0.10.0 · S2)."""
+        C = COLORS
+        p = tk.Frame(host, bg=C["bg_card"])
+        row = tk.Frame(p, bg=C["bg_card"])
+        row.pack(fill="x")
+        tk.Label(row, text="Reference", font=FONTS["small"], fg=C["text"], bg=C["bg_card"]).pack(side="left")
+        self._ref_label = tk.Label(row, text="none chosen", font=FONTS["small"], fg=C["text_dim"], bg=C["bg_input"],
+                                   anchor="w", padx=8, pady=2, highlightbackground=C["border"], highlightthickness=1)
+        self._ref_label.pack(side="left", fill="x", expand=True, padx=(8, 6))
+        self._ref_tip = Tooltip(self._ref_label, "A subtitle of the same film that is in sync with your video.")
+        self._flat_btn(row, "Choose…", self._choose_reference, padx=10, pady=2).pack(side="left")
+        row2 = tk.Frame(p, bg=C["bg_card"])
+        row2.pack(fill="x", pady=(8, 0))
+        self._check_cuts = tk.Checkbutton(row2, text="Look for cuts (another version of the film)",
+                                          variable=self._detect_cuts, font=FONTS["tiny"], fg=C["text"],
+                                          bg=C["bg_card"], activebackground=C["bg_card"], selectcolor=C["bg_input"],
+                                          activeforeground=C["text"], highlightthickness=0, bd=0)
+        self._check_cuts.pack(side="left")
+        self._sync_cancel_link = self._link(row2, "Cancel", self._sync_cancel_job)
+        self._sync_prog = ttk.Progressbar(row2, style="P.Horizontal.TProgressbar", length=self.px(140),
+                                          mode="determinate", maximum=1.0)
+        self._sync_prog_label = tk.Label(row2, text="", font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"])
+        self._analyse_btn = self._flat_btn(row2, "Analyse", self._sync_analyse, padx=14, pady=3)
+        self._analyse_btn.pack(side="right")
+        self._panel_help(p, "Any language works: only the timing is compared (when text is on screen). The "
+                            "reference must be in sync with your video.").pack(fill="x", pady=(6, 0))
+        self._refcheck_row = tk.Frame(p, bg=C["bg_card"])
+        self._refcheck_link = self._link(self._refcheck_row, "Check the reference against the video's audio",
+                                         self._check_reference_audio)
+        self._refcheck_link.pack(side="left")
+        self._refcheck_note = tk.Label(self._refcheck_row, text="", font=FONTS["tiny"], fg=C["text_dim"],
+                                       bg=C["bg_card"])
+        self._refcheck_note.pack(side="left", padx=(8, 0))
+        return p
+
+    def _build_track_panel(self, host):
+        """Track in a video (S5): a subtitle inside an MKV/MP4 becomes the reference for To another subtitle."""
+        C = COLORS
+        p = tk.Frame(host, bg=C["bg_card"])
+        row = tk.Frame(p, bg=C["bg_card"])
+        row.pack(fill="x")
+        self._flat_btn(row, "Choose a video…", lambda: self._open_video(None, "reference"), padx=14,
+                       pady=3).pack(side="left")
+        self._panel_help(p, "Many MKV files carry subtitles that are in sync with their video. Pick one of its text "
+                            "tracks (any language) as the reference; then Analyse.").pack(fill="x", pady=(6, 0))
+        return p
+
+    def _build_video_panel(self, host):
+        """To the video (v0.10.0 · S4): the video, its audio track, Analyse."""
+        C = COLORS
+        p = tk.Frame(host, bg=C["bg_card"])
+        row = tk.Frame(p, bg=C["bg_card"])
+        row.pack(fill="x")
+        tk.Label(row, text="Video", font=FONTS["small"], fg=C["text"], bg=C["bg_card"], width=9,
+                 anchor="w").pack(side="left")
+        self._video_label = tk.Label(row, text="none chosen", font=FONTS["small"], fg=C["text_dim"],
+                                     bg=C["bg_input"], anchor="w", padx=8, pady=2, highlightbackground=C["border"],
+                                     highlightthickness=1)
+        self._video_label.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._video_tip = Tooltip(self._video_label, "The video this subtitle belongs to (MKV, MP4, AVI…).")
+        self._flat_btn(row, "Choose…", self._choose_video, padx=10, pady=2).pack(side="left")
+        row2 = tk.Frame(p, bg=C["bg_card"])
+        row2.pack(fill="x", pady=(6, 0))
+        tk.Label(row2, text="Audio", font=FONTS["small"], fg=C["text"], bg=C["bg_card"], width=9,
+                 anchor="w").pack(side="left")
+        self._audio_var = tk.StringVar()
+        self._audio_combo = ttk.Combobox(row2, textvariable=self._audio_var, state="readonly",
+                                         style="Lang.TCombobox", font=FONTS["small"], width=46)
+        self._audio_combo.pack(side="left")
+        _no_wheel(self._audio_combo)
+        self._video_analyse_btn = self._flat_btn(row2, "Analyse", self._video_analyse, padx=14, pady=3)
+        self._video_analyse_btn.pack(side="right")
+        self._video_prog_row = tk.Frame(p, bg=C["bg_card"])
+        self._video_prog_label = tk.Label(self._video_prog_row, text="", font=FONTS["tiny"], fg=C["text_dim"],
+                                          bg=C["bg_card"])
+        self._video_prog_label.pack(side="left")
+        self._video_prog = ttk.Progressbar(self._video_prog_row, style="P.Horizontal.TProgressbar",
+                                           length=self.px(200), mode="determinate", maximum=1.0)
+        self._video_prog.pack(side="left", padx=(8, 0))
+        self._link(self._video_prog_row, "Cancel", self._sync_cancel_job).pack(side="left", padx=(8, 0))
+        self._panel_help(p, "Finds where people speak in the audio and matches the subtitle to it. Reading the "
+                            "audio takes a while (about a minute for a film); it is kept for the next time. Music "
+                            "and noise lower the confidence.").pack(fill="x", pady=(6, 0))
+        return p
+
+    def _build_folder_panel(self, host):
+        C = COLORS
+        p = tk.Frame(host, bg=C["bg_card"])
+        row = tk.Frame(p, bg=C["bg_card"])
+        row.pack(fill="x")
+        self._folder_btn = self._flat_btn(row, "Choose a folder…", self._check_folder, padx=14, pady=3)
+        self._folder_btn.pack(side="left")
+        self._folder_status = tk.Label(row, text="", font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"])
+        self._folder_status.pack(side="left", padx=(10, 0))
+        self._panel_help(p, "Every subtitle in the folder is compared with the loaded subtitle, which must be in "
+                            "sync with the video. Nothing is changed; the result is a table you can copy or save.").pack(
+            fill="x", pady=(6, 0))
+        return p
+
+    def _build_later_panel(self, host):
+        p = tk.Frame(host, bg=COLORS["bg_card"])
+        self._later_label = self._panel_help(p, "")
+        self._later_label.pack(fill="x")
+        return p
+
+    def _tp_index(self, key):
+        """Index of the block typed in Two points (by its number, else its position); None if not found."""
+        text = self._tp[key]["block"].get().strip().lstrip("#")
+        if not text:
+            return None
+        for i, b in enumerate(self.source_blocks):
+            if str(b.get("id")) == text:
+                return i
+        if text.isdigit() and 1 <= int(text) <= len(self.source_blocks):
+            return int(text) - 1
+        return None
+
+    def _tp_block_changed(self, key):
+        i = self._tp_index(key)
+        w = self._tp[key]
+        if i is None:
+            w["now"].configure(text="?")
+            w["words"].configure(text="")
+        else:
+            s, _ = timestamp_ms(self.source_blocks[i]["timestamp"])
+            w["now"].configure(text=srt_sync.fmt_ms(s))
+            w["words"].configure(text=middle_ellipsis(srt_sync.first_words(self.source_blocks[i], 7), 46))
+        self._sync_recompute()
+
+    def _sync_set_defaults(self):
+        """Fine-tune values that change nothing: offset 0, same frame rate, both points at their own times."""
+        self._sh_var.set("0.000")
+        fps = f"{self.doc.fps:g}" if self.doc is not None and self.doc.fps else "25"
+        self._fr_from.set(fps)
+        self._fr_to.set(fps)
+        idx = srt_sync.dialogue_indexes(self.source_blocks) or list(range(len(self.source_blocks)))
+        for key, i in (("a", idx[0] if idx else None), ("b", idx[-1] if idx else None)):
+            w = self._tp[key]
+            if i is None:
+                w["block"].set("")
+                w["correct"].set("")
+                continue
+            w["block"].set(str(self.source_blocks[i]["id"]))
+            w["correct"].set(srt_sync.fmt_ms(timestamp_ms(self.source_blocks[i]["timestamp"])[0]))
+
+    def _sync_reset(self):
+        """A new subtitle was loaded: forget the sync of the last one."""
+        self._sync_snapshot = None
+        self._sync_info = None
+        self._video_ms = self._video_fps = None
+        self._auto, self._sync_check = None, None
+        self._sync_job = None            # a running analysis of the previous file is ignored when it ends
+        self._set_reference(self.context_path if self.context_path and Path(self.context_path).exists() else "")
+        vids = video_candidates(self.input_path) if self.input_path else []
+        self._set_video(vids[0] if vids else "", probe=False)
+        self._sync_set_defaults()
+        self._update_sync_row()
+        self._sync_recompute()
+        self.after(150, self._start_check_on_load)
+
+    def _select_sync_method(self, key):
+        C = COLORS
+        self._sync_method = key
+        for k, (row, a, b, ready) in self._sync_items.items():
+            on = k == key
+            bg = C["chip_sel_bg"] if on else C["bg_card"]
+            for w in (row, a, b):
+                w.configure(bg=bg)
+            a.configure(fg=C["chip_sel_fg"] if on else (C["text"] if ready else C["text_dim"]))
+        ready = self._sync_items[key][3]
+        panel = ("auto" if key in ("auto_sub", "check") else "video" if key == "auto_video" else
+                 "track" if key == "auto_track" else key) if ready else "later"
+        for k, p in self._sync_panels.items():
+            if k == panel:
+                p.pack(fill="x")
+            else:
+                p.pack_forget()
+        if not ready:
+            label = next(m[2] for m in SYNC_METHODS if m[1] == key)
+            self._later_label.configure(text=f"{label}: built in a later step of v0.10.0. Use Fine-tune for now.")
+        if key in ("auto_sub", "check"):
+            self._analyse_btn.configure(text="Check" if key == "check" else "Analyse")
+            self._check_cuts.configure(state="normal")
+            if self._video_path:
+                self._refcheck_row.pack(fill="x", pady=(4, 0))
+            else:
+                self._refcheck_row.pack_forget()
+        self._sync_tree.configure(displaycolumns=("num", "old", "new", "text", "ref") if key == "auto_sub"
+                                  else ("num", "old", "new", "text"))
+        self._sync_recompute()
+
+    def _sync_build_map(self):
+        """(TimeMap, '') for the values in the current panel, or (None, reason)."""
+        m = self._sync_method
+        try:
+            if m == "shift":
+                return srt_sync.map_shift(srt_sync.to_ms(self._sh_var.get() or "0")), ""
+            if m == "scale":
+                f, to = float(self._fr_from.get().replace(",", ".")), float(self._fr_to.get().replace(",", "."))
+                if not (10 <= f <= 120 and 10 <= to <= 120):
+                    return None, "Frame rates go from 10 to 120 fps."
+                return srt_sync.map_scale(srt_sync.fps_ratio(f, to)), ""
+            if m in ("auto_sub", "auto_video"):
+                a = self._auto_valid(m)
+                if a is None or a["res"].status == "cannot_tell":
+                    return None, ""
+                return a["res"].tmap, ""
+            if m == "two_point":
+                pts = []
+                for key in ("a", "b"):
+                    i = self._tp_index(key)
+                    if i is None:
+                        return None, f"Block {key.upper()}: type the number of a block in this subtitle."
+                    old = timestamp_ms(self.source_blocks[i]["timestamp"])[0]
+                    pts.append((old, srt_sync.to_ms(self._tp[key]["correct"].get())))
+                return srt_sync.map_two_point(*pts), ""
+        except ValueError as e:
+            msg = str(e)
+            return None, ("Type a number of seconds (−2.35) or a time (00:01:02,350)." if msg.startswith("not a")
+                          else msg[:1].upper() + msg[1:] + ".")
+        return None, ""
+
+    def _sync_recompute(self):
+        if not hasattr(self, "_sync_tree"):
+            return
+        self._sync_pending, self._sync_error = None, ""
+        ready = self._sync_items[self._sync_method][3]
+        if self.source_blocks and ready and self._sync_method not in ("check", "folder", "auto_track"):
+            tmap, err = self._sync_build_map()
+            self._sync_error = err
+            if tmap is not None:
+                self._sync_pending = (tmap, srt_sync.apply_map(self.source_blocks, tmap))
+        self._fill_sync_preview()
+        self._update_sync_facts()
+        self._update_sync_verdict()
+        self._draw_timeline()
+        self._update_sync_buttons()
+
+    def _fill_sync_preview(self):
+        tv = self._sync_tree
+        tv.delete(*tv.get_children())
+        if not self.source_blocks:
+            return
+        res = self._sync_pending[1] if self._sync_pending else srt_sync.apply_map(self.source_blocks,
+                                                                                  srt_sync.map_shift(0))
+        rows = srt_sync.preview_rows(self.source_blocks, res)
+        idx = srt_sync.preview_indexes(len(self.source_blocks))
+        prev = None
+        for i, row in zip(idx, rows):
+            if prev is not None and i != prev + 1:
+                tv.insert("", "end", values=("…", "", "", ""), tags=("gap",))
+            prev = i
+            tag = "dropped" if row[2] == "(dropped)" else "moved" if row[1] != row[2] else ""
+            ref = self._ref_text_at(row[2]) if self._sync_method == "auto_sub" else ""
+            tv.insert("", "end", values=row + (ref,), tags=(tag,) if tag else ())
+
+    def _ref_text_at(self, when: str) -> str:
+        """The reference line on screen at this time (or starting within 1 s of it)."""
+        a = self._auto_valid("auto_sub")
+        if a is None or not when or when.startswith("("):
+            return ""
+        try:
+            t = srt_sync.to_ms(when)
+        except ValueError:
+            return ""
+        import bisect
+        starts = a["ref_starts"]
+        k = bisect.bisect_right(starts, t + 1000) - 1
+        for j in (k, k - 1):
+            if 0 <= j < len(starts):
+                s, e = a["ref_times"][j]
+                if s - 1000 <= t <= e:
+                    return " / ".join(l for l in a["ref_blocks"][j]["text_lines"] if l.strip())
+        return ""
+
+    def _auto_valid(self, method=None):
+        """The automatic result, if it was found for the subtitle as it is now (and, if given, by this method:
+        'auto_sub' / 'check' use a subtitle result, 'auto_video' a video result)."""
+        a = self._auto
+        if a is None or a["blocks"] is not self.source_blocks:
+            return None
+        if method == "auto_video" and a.get("kind") != "video":
+            return None
+        if method in ("auto_sub", "check") and a.get("kind") == "video":
+            return None
+        return a
+
+    def _update_sync_facts(self):
+        f = self._facts
+        for k in f:
+            f[k].configure(text="—", fg=COLORS["text"])
+        if not self.source_blocks:
+            return
+        a = self._auto_valid(self._sync_method) if self._sync_method in ("auto_sub", "check", "auto_video") else None
+        if a is not None:
+            res = a["res"]
+            f["offset"].configure(text=srt_sync.fmt_offset(-res.offset_ms))     # how far off it is now
+            f["speed"].configure(text=f"{res.ratio:.4f}")
+            f["cuts"].configure(text="none" if len(res.segments) == 1 else
+                                (f"{len(res.segments) - 1}" if res.status == "cut" else
+                                 f"{len(res.segments)} sections"))
+            f["match"].configure(text=f"{res.overlap_before:.2f} → {res.overlap_after:.2f}")
+            f["unmatched"].configure(text=f"{len(res.unmatched)}")
+            return
+        if self._sync_method in ("check", "folder", "auto_sub", "auto_video"):
+            return
+        tmap = self._sync_pending[0] if self._sync_pending else None
+        if tmap is None or tmap.is_identity:
+            status = sync_status_text(self.doc)
+            if status:
+                f["offset"].configure(text=status.replace("synced: ", ""), fg=COLORS["chip_ok_fg"])
+            else:
+                f["offset"].configure(text="0.000 s")
+            f["speed"].configure(text="1.0000")
+            f["cuts"].configure(text="none")
+            return
+        idx = srt_sync.dialogue_indexes(self.source_blocks)
+        t0 = timestamp_ms(self.source_blocks[idx[0]]["timestamp"])[0] if idx else 0
+        f["offset"].configure(text=srt_sync.fmt_offset(tmap.offset_at(t0)))
+        f["speed"].configure(text=f"{tmap.ratio:.4f}")
+        f["cuts"].configure(text="none" if tmap.is_linear else str(len(tmap.segments) - 1))
+
+    def _wrap_verdict(self):
+        """Wrap the verdict text to the box, leaving room for the Fix-it button when it shows."""
+        width = self._sv_box.winfo_width() - self.px(40)
+        if self._sv_btn.winfo_manager():
+            width -= self._sv_btn.winfo_reqwidth() + self.px(12)
+        for w in (self._sv_title, self._sv_sub):
+            w.configure(wraplength=max(200, width))
+
+    def _set_verdict(self, title, sub, kind="", hints=(), button=None):
+        C = COLORS
+        fg, bg, bd, subfg = {"warn": (C["warning"], C["chip_warn_bg"], C["chip_warn_bd"], C["verdict_warn_sub"]),
+                             "ok": (C["chip_ok_fg"], C["chip_ok_bg"], C["chip_ok_bd"], C["text"]),
+                             "bad": (C["error"], C["chip_bad_bg"], C["chip_bad_bd"], C["text"]),
+                             "info": (C["accent_soft"], C["chip_sel_bg"], C["chip_sel_bd"], C["text"])}.get(
+            kind, (C["text_bright"], C["bg_input"], C["border"], C["text_dim"]))
+        self._sv_box.configure(bg=bg, highlightbackground=bd)
+        self._sv_title.configure(text=title, fg=fg, bg=bg)
+        self._sv_sub.configure(text=sub, fg=subfg, bg=bg)
+        h = self._sv_hints
+        for w in h.winfo_children():
+            w.destroy()
+        h.configure(bg=bg)
+        if button:
+            text, cmd, enabled = button
+            self._sv_btn.configure(text=text, command=cmd, state="normal" if enabled else "disabled")
+            self._sv_btn.grid(row=0, column=1, rowspan=2, padx=(0, 12), pady=8, sticky="e")
+        else:
+            self._sv_btn.grid_forget()
+        self._wrap_verdict()
+        if hints:
+            h.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 9))
+            for hint in hints:
+                r = tk.Frame(h, bg=bg)
+                r.pack(fill="x", pady=1)
+                lbl = tk.Label(r, text="• " + hint["text"], font=FONTS["tiny"], fg=C["text"], bg=bg, anchor="w",
+                               justify="left", wraplength=max(240, self._sv_box.winfo_width() - self.px(140)))
+                lbl.pack(side="left", fill="x", expand=True)
+                self._link(r, "Try it", lambda hint=hint: self._try_hint(hint), bg=bg).pack(side="right", padx=(8, 0))
+        else:
+            h.grid_forget()
+
+    def _update_sync_verdict(self):
+        if not self.source_blocks:
+            self._set_verdict("No subtitle loaded", "Open a subtitle first; then check or fix its timing here.")
+            return
+        m = self._sync_method
+        if not self._sync_items[m][3]:
+            label = next(x[2] for x in SYNC_METHODS if x[1] == m)
+            self._set_verdict(f"{label}: not ready yet", "This method comes in a later step of v0.10.0.")
+            return
+        if m in ("auto_sub", "check", "auto_video"):
+            self._auto_verdict(m)
+            return
+        if m == "auto_track":
+            self._set_verdict("Track in a video", "Choose a video with subtitles inside; its track becomes the "
+                              "reference of To another subtitle.")
+            return
+        if m == "folder":
+            self._set_verdict("Check a folder", "Choose a folder: each subtitle in it is compared with the loaded "
+                              "subtitle, and you get one table with the status of each.")
+            return
+        if self._sync_error:
+            self._set_verdict("Cannot use these values", self._sync_error, "bad")
+            return
+        tmap, res = self._sync_pending
+        if tmap.is_identity:
+            hints = srt_sync.hints(self.source_blocks, self._video_ms, self._video_fps, Path(self.input_path).name)
+            status = sync_status_text(self.doc)
+            if status:
+                self._set_verdict(f"✓ {status[0].upper()}{status[1:]}",
+                                  "The loaded subtitle has the new times. Translate it, or Save synced copy… to "
+                                  "write it. Undo sync restores the original times. A new value here is applied "
+                                  "on top.", "ok", hints)
+            else:
+                self._set_verdict("No change yet", "Type a value; the preview shows the new times. "
+                                  + ("Hints from the subtitle alone:" if hints else
+                                     "No reference is chosen and the subtitle itself shows no clear problem."),
+                                  "", hints)
+            return
+        parts = [f"{res.moved:,} of {len(self.source_blocks):,} blocks move."]
+        if res.dropped:
+            parts.append(f"{len(res.dropped)} block(s) would end before 0:00 and are dropped.")
+        if res.clamped:
+            parts.append(f"{len(res.clamped)} block(s) start at 0:00 (clamped).")
+        parts.append("Apply gives the loaded subtitle these times; Save synced copy… writes a file.")
+        self._set_verdict(tmap.label, " ".join(parts), "warn" if res.dropped else "info")
+
+    def _auto_verdict(self, m):
+        if self._sync_job is not None:
+            if m == "auto_video":
+                self._set_verdict("Analysing…", "Reading the audio and finding the speech; then the subtitle is "
+                                  "matched to it.", "info")
+            else:
+                self._set_verdict("Analysing…", "Comparing the timing of the two subtitles. This takes a few "
+                                  "seconds.", "info")
+            return
+        a = self._auto_valid(m)
+        if a is None:
+            status = sync_status_text(self.doc)
+            if status:
+                self._set_verdict(f"✓ {status[0].upper()}{status[1:]}",
+                                  "The loaded subtitle has the new times. Translate it, or Save synced copy… to write "
+                                  "it. Undo sync restores the original times.", "ok")
+            elif m == "auto_video":
+                self._set_verdict("Ready to compare" if self._video_path else "Choose the video",
+                                  f"Video: {Path(self._video_path).name}. Press Analyse." if self._video_path else
+                                  "The video this subtitle belongs to; its audio is compared with the subtitle.", "")
+            elif self._ref_path:
+                self._set_verdict("Ready to compare", f"Reference: {Path(self._ref_path).name}. Press "
+                                  f"{'Check' if m == 'check' else 'Analyse'}.", "")
+            else:
+                self._set_verdict("Choose a reference", "A subtitle of the same film that is in sync with your video, "
+                                  "in any language (another language works as well as your own).", "")
+            return
+        res, name = a["res"], (Path(a["ref_path"]).name if a.get("kind") == "video" else self._ref_name(a["ref_path"]))
+        conf = f"Confidence {res.confidence:.2f}."
+        what_ref = "the speech in its audio" if a.get("kind") == "video" else "timing only"
+        if res.status == "cut":
+            what = f"{len(res.segments)} parts; " + (f"{len(res.ref_gaps)} stretch(es) of the reference have no "
+                                                    "line here (scenes not in this version)." if res.ref_gaps else "")
+        elif res.status == "uneven" and len(res.segments) > 1:
+            what = f"{len(res.segments)} sections with slightly different offsets."
+        elif res.status == "cannot_tell":
+            what = "The two subtitles have too little timing in common: probably not the same film, or not the " \
+                   "same version. Nothing is changed."
+        else:
+            what = ("Same speed" if abs(res.ratio - 1) < 1e-6 else srt_sync.describe_ratio(res.ratio)) + \
+                   (", no cuts found." if len(res.segments) == 1 else ".")
+        if res.status == "cut" and a.get("kind") == "video" and res.ref_gaps:
+            what = f"{len(res.segments)} parts; {len(res.ref_gaps)} stretch(es) of speech have no subtitle " \
+                   "(scenes not in this version)."
+        sub = f"Compared with “{name}” ({what_ref}). {what} {conf}"
+        if res.low_confidence and res.status != "cannot_tell":
+            sub += " Low confidence — check the preview before applying."
+        kind = {"in_sync": "ok", "cannot_tell": "", "cut": "bad"}.get(res.status, "warn")
+        title = res.status_text()
+        if res.status == "in_sync":
+            self._set_verdict(title, f"Compared with “{name}” ({what_ref}). Nothing to change. {conf}", "ok")
+            return
+        if res.status == "cannot_tell":
+            self._set_verdict(title, sub, kind)
+            return
+        if m == "check":
+            btn = ("Fix it…", lambda: self._select_sync_method("auto_sub"), True)
+        else:
+            btn = (res.fix_label(), self._sync_apply, not self.is_translating)
+        self._set_verdict(title, sub, kind, button=btn)
+
+    def _try_hint(self, hint):
+        fill = hint.get("fill") or {}
+        m = fill.get("method")
+        if m == "scale":
+            self._fr_from.set(f"{fill['from']:g}")
+            self._fr_to.set(f"{fill['to']:g}")
+        elif m == "two_point":
+            for key in ("a", "b"):
+                i = fill.get(key)
+                if i is not None and i < len(self.source_blocks):
+                    self._tp[key]["block"].set(str(self.source_blocks[i]["id"]))
+        if m in self._sync_panels:
+            self._select_sync_method(m)
+            if m == "two_point":
+                self._tp["a"]["entry"].focus_set()
+                self._tp["a"]["entry"].select_range(0, "end")
+
+    def _draw_timeline(self):
+        cv = getattr(self, "_timeline", None)
+        if cv is None:
+            return
+        C = COLORS
+        cv.delete("all")
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 50:
+            return
+        pad = self.px(10)
+        if not self.source_blocks:
+            cv.create_text(w // 2, h // 2, text="The timing of the subtitle shows here", fill=C["text_dim"],
+                           font=FONTS["tiny"])
+            return
+        res = self._sync_pending[1] if self._sync_pending else None
+        idx = srt_sync.dialogue_indexes(self.source_blocks) or [0]
+        t0 = max(0, timestamp_ms(self.source_blocks[idx[0]]["timestamp"])[0] - 5_000)
+        span = TIMELINE_SPAN_MS
+        old = [timestamp_ms(b["timestamp"]) for b in self.source_blocks]
+        new = [timestamp_ms(b["timestamp"]) for b in res.blocks] if res is not None else old
+        a = self._auto_valid(self._sync_method) if self._sync_method in ("auto_sub", "check", "auto_video") \
+            else None
+        if a is not None:                      # reference, this subtitle now, and after the fix
+            lanes = [(a["ref_times"], C["accent"]), (old, C["warning"]), (new, C["success"])]
+            title = ("Speech (blue)" if a.get("kind") == "video" else "Reference (blue)") + \
+                ", this subtitle now (amber) and after the fix (green), 2 minutes"
+        else:
+            lanes = [(old, C["warning"]), (new, C["accent"])]
+            title = "Now (amber) and after the change (blue), 2 minutes"
+        lane_h = self.px(12) if len(lanes) == 2 else self.px(9)
+        y1 = self.px(20)
+        ys = [y1 + k * (lane_h + self.px(4 if len(lanes) == 3 else 6)) for k in range(len(lanes))]
+        y2 = ys[-1]
+        x = lambda t: pad + (t - t0) / span * (w - 2 * pad)       # noqa: E731
+        for y in ys:
+            cv.create_rectangle(pad, y, w - pad, y + lane_h, fill=C["lane_bg"], outline="")
+        for (times, col), y in zip(lanes, ys):
+            for s, e in times:
+                if e < t0 or s > t0 + span:
+                    continue
+                cv.create_rectangle(max(pad, x(s)), y + 2, min(w - pad, max(x(s) + 2, x(e))), y + lane_h - 2,
+                                    fill=col, outline="")
+        cv.create_text(pad, self.px(10), text=srt_sync.fmt_ms(t0)[:8], anchor="w", fill=C["text_dim"],
+                       font=FONTS["tiny"])
+        cv.create_text(w - pad, self.px(10), text=srt_sync.fmt_ms(t0 + span)[:8], anchor="e", fill=C["text_dim"],
+                       font=FONTS["tiny"])
+        cv.create_text(w // 2, self.px(10), text=title, fill=C["text_dim"], font=FONTS["tiny"])
+        moved = res is not None and not self._sync_pending[0].is_identity
+        cv.create_text(w // 2, y2 + lane_h + self.px(10),
+                       text="the bars move with the change" if moved else "no change: both lanes are the same",
+                       fill=C["text_dim"], font=FONTS["tiny"])
+
+    def _update_sync_buttons(self):
+        busy = self.is_translating
+        can_apply = bool(self._sync_pending and not self._sync_pending[0].is_identity and not busy)
+        synced = bool(self.doc is not None and self.doc.time_maps)
+        self._sync_apply_btn.configure(state="normal" if can_apply else "disabled")
+        self._sync_save_btn.configure(state="normal" if synced and not busy else "disabled")
+        self._sync_undo_btn.configure(state="normal" if self._sync_snapshot is not None and not busy else "disabled")
+        self._sync_report_btn.configure(state="normal" if self._sync_info else "disabled")
+        if hasattr(self, "_analyse_btn"):
+            running = self._sync_job is not None
+            self._analyse_btn.configure(state="disabled" if running or busy or not self.source_blocks else "normal")
+            self._video_analyse_btn.configure(state="disabled" if running or busy or not self.source_blocks
+                                              or not self._video_path else "normal")
+            if running and self._sync_method == "auto_video":
+                self._video_prog_row.pack(fill="x", pady=(6, 0))
+            else:
+                self._video_prog_row.pack_forget()
+            self._folder_btn.configure(state="disabled" if running or busy or not self.source_blocks else "normal")
+            if running:
+                self._sync_prog_label.pack(side="left", padx=(10, 0))
+                self._sync_prog.pack(side="left", padx=(8, 0))
+                self._sync_cancel_link.pack(side="left", padx=(8, 0))
+            else:
+                for wdg in (self._sync_prog_label, self._sync_prog, self._sync_cancel_link):
+                    wdg.pack_forget()
+
+    def _update_sync_row(self):
+        if not hasattr(self, "_sync_row_chip"):
+            return
+        C = COLORS
+        status = sync_status_text(self.doc) if self.doc is not None else ""
+        chk = self._sync_check if self._sync_check and self._sync_check[2] is self.source_blocks else None
+        if status:
+            self._sync_row_chip.configure(text="✓ " + status, fg=C["chip_ok_fg"], bg=C["chip_ok_bg"],
+                                          highlightbackground=C["chip_ok_bd"])
+            self._sync_row_link.configure(text="Details…")
+        elif chk:
+            text, kind = sync_check_chip(chk[0], chk[1])
+            fg, bg, bd = {"ok": (C["chip_ok_fg"], C["chip_ok_bg"], C["chip_ok_bd"]),
+                          "warn": (C["warning"], C["chip_warn_bg"], C["chip_warn_bd"]),
+                          "bad": (C["error"], C["chip_bad_bg"], C["chip_bad_bd"])}.get(
+                kind, (C["text_dim"], C["bg_input"], C["border"]))
+            self._sync_row_chip.configure(text=text, fg=fg, bg=bg, highlightbackground=bd)
+            self._sync_row_link.configure(text="Details" if kind in ("ok", "") else "Fix…")
+        else:
+            self._sync_row_chip.configure(text="not checked", fg=C["text_dim"], bg=C["bg_input"],
+                                          highlightbackground=C["border"])
+            self._sync_row_link.configure(text="Sync…")
+
+    def _open_sync_tab(self):
+        if self.source_blocks:
+            self.notebook.select(self.TAB_SYNC)
+            a = self._auto_valid()
+            if a is not None and self._sync_method not in ("auto_sub", "check", "auto_video"):
+                self._select_sync_method("auto_video" if a.get("kind") == "video" else "auto_sub")
+
+    # ── automatic sync (S2) ──────────────────────────────────────────
+
+    def _ref_name(self, path: str) -> str:
+        """The name shown for a reference: a track taken from a video shows the video and the track."""
+        return getattr(self, "_ref_names", {}).get(path) or Path(path).name
+
+    def _set_reference(self, path: str):
+        self._ref_path = path or ""
+        if hasattr(self, "_ref_label"):
+            self._ref_label.configure(text=middle_ellipsis(self._ref_name(path), 60) if path else "none chosen",
+                                      fg=COLORS["text"] if path else COLORS["text_dim"])
+            self._ref_tip.text = path or "A subtitle of the same film that is in sync with your video."
+
+    def _choose_reference(self):
+        start = Path(self._ref_path or self.input_path or ".").parent
+        path = filedialog.askopenfilename(title="Reference subtitle (in sync with the video), or a video with one inside",
+                                          initialdir=str(start), filetypes=OPEN_ANY_FILETYPES)
+        if path and Path(path).suffix.lower() in OPEN_VIDEO_EXTS:
+            self._open_video(path, "reference")
+        elif path:
+            self._set_reference(path)
+            self._auto = None
+            self._sync_recompute()
+
+    def _sync_cancel_job(self):
+        self._sync_cancel = True
+
+    def _sync_analyse(self, quiet: bool = False):
+        """Compare the loaded subtitle with the reference in a worker thread. quiet: the check on load (no
+        message boxes; only the SOURCE card and the log)."""
+        if self._sync_job is not None or not self.source_blocks or self.is_translating:
+            return
+        if not self._ref_path:
+            if quiet:
+                return
+            self._choose_reference()
+            if not self._ref_path:
+                return
+        if same_file(self._ref_path, self.input_path):
+            if not quiet:
+                messagebox.showwarning("Reference", "The reference is the loaded subtitle itself. Choose another "
+                                                    "subtitle of the same film.", parent=self)
+            return
+        if not _has_numpy():
+            if not quiet:
+                messagebox.showwarning("Package missing", "Sync to another subtitle needs the numpy package:\n"
+                                                          "python -m pip install numpy", parent=self)
+            return
+        if quiet:
+            try:
+                ref = load_subtitle(self._ref_path)
+            except Exception as e:
+                self._log(f"Sync check skipped: cannot read {Path(self._ref_path).name} ({e})", "warn")
+                return
+        else:
+            ref = self._read_doc(self._ref_path, "the reference")
+            if not ref:
+                return
+        blocks, path, cuts = self.source_blocks, self._ref_path, self._detect_cuts.get()
+        fps = [d.fps for d in (self.doc, ref) if d is not None and d.fmt == "microdvd" and d.fps]
+        frame_ms = 1000 / min(fps) if fps else None
+        token = object()
+        self._sync_job, self._sync_cancel = token, False
+        self._sync_prog["value"] = 0
+        self._sync_prog_label.configure(text="Starting…")
+        self._sync_recompute()
+
+        def progress(frac, text):
+            self._post(lambda: self._sync_progress(token, frac, text))
+
+        def work():
+            try:
+                res = srt_sync.match_blocks(ref.blocks, blocks, detect_cuts=cuts, progress=progress,
+                                            cancel=lambda: self._sync_cancel or self._sync_job is not token,
+                                            frame_ms=frame_ms)
+                self._post(lambda: self._sync_done(token, res, path, ref, blocks, quiet))
+            except srt_sync.Cancelled:
+                self._post(lambda: self._sync_done(token, None, path, ref, blocks, quiet, "cancelled"))
+            except Exception as e:
+                err = _err(e)
+                self._post(lambda: self._sync_done(token, None, path, ref, blocks, quiet, err))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _sync_progress(self, token, frac, text):
+        if token is self._sync_job:
+            self._sync_prog["value"] = frac
+            self._sync_prog_label.configure(text=text)
+
+    def _sync_done(self, token, res, path, ref, blocks, quiet, error=""):
+        if token is not self._sync_job:
+            return
+        self._sync_job = None
+        name = self._ref_name(path)
+        if error == "cancelled":
+            self._log("Sync analysis cancelled.", "info")
+        elif error:
+            self._log(f"Sync analysis failed: {error}", "error")
+            if not quiet:
+                messagebox.showerror("Sync", f"The analysis failed:\n{error}", parent=self)
+        elif blocks is self.source_blocks:
+            times = [timestamp_ms(b["timestamp"]) for b in ref.blocks]
+            order = sorted(range(len(times)), key=lambda i: times[i][0])
+            self._auto = {"res": res, "ref_path": path, "ref_blocks": [ref.blocks[i] for i in order],
+                          "ref_times": [times[i] for i in order], "ref_starts": [times[i][0] for i in order],
+                          "blocks": blocks, "ref_label": ref.label}
+            self._sync_check = (res, name, blocks)
+            self._log(f"Sync check{' (on load)' if quiet else ''}: {res.status_text(name)} — confidence "
+                      f"{res.confidence:.2f}, overlap {res.overlap_before:.2f} → {res.overlap_after:.2f} "
+                      f"({res.elapsed:.1f} s)", "success" if res.status == "in_sync" else "warn")
+            self._prefill_fine_tune(res)
+        self._update_sync_row()
+        self._sync_recompute()
+
+    def _prefill_fine_tune(self, res):
+        """Fine-tune starts from what the automatic step found (decision 24)."""
+        if res.status == "cannot_tell" or res.tmap is None:
+            return
+        if res.tmap.is_linear and abs(res.ratio - 1) < 1e-6:
+            self._sh_var.set(srt_sync.fmt_seconds(res.offset_ms))
+        if abs(res.ratio - 1) > 1e-6:
+            for f, to in srt_sync.FPS_PRESETS:
+                if abs(srt_sync.fps_ratio(f, to) - res.ratio) < 1e-4:
+                    self._fr_from.set(f"{f:g}")
+                    self._fr_to.set(f"{to:g}")
+        idx = srt_sync.dialogue_indexes(self.source_blocks)
+        if idx:
+            for key, i in (("a", idx[0]), ("b", idx[-1])):
+                self._tp[key]["block"].set(str(self.source_blocks[i]["id"]))
+                self._tp[key]["correct"].set(srt_sync.fmt_ms(res.tmap(timestamp_ms(
+                    self.source_blocks[i]["timestamp"])[0])))
+
+    def _start_check_on_load(self):
+        """After a subtitle is opened: compare it with the context file or a subtitle of the same film next to it
+        (Settings → Output → SYNC CHECK). It only reports."""
+        if not self.sync_check_on_load.get() or not self.input_path:
+            return
+        cands = ([self.context_path] if self.context_path and Path(self.context_path).exists() else []) + \
+            reference_candidates(self.input_path)
+        if not cands:
+            return
+        self._set_reference(cands[0])
+        self._sync_analyse(quiet=True)
+
+    # ── subtitles inside a video (S5) ─────────────────────────────────
+
+    def _from_video(self):
+        self._open_video(None, "source")
+
+    def _open_video(self, video, purpose: str):
+        """purpose 'source' (load a track as the subtitle) or 'reference' (a track as the sync reference)."""
+        if purpose == "reference" and not self.source_blocks:
+            messagebox.showinfo("Track in a video", "Open the subtitle to sync first; then choose the video whose "
+                                                    "track is the reference.", parent=self)
+            return
+        if video is None:
+            start = Path(self._video_path or self.input_path or ".").parent
+            video = filedialog.askopenfilename(title="Video with subtitles inside", initialdir=str(start),
+                                               filetypes=[("Videos", " ".join(f"*{e}" for e in OPEN_VIDEO_EXTS)),
+                                                          ("All files", "*.*")])
+            if not video:
+                return
+        self.ensure_ffmpeg("Taking a subtitle from a video", lambda ff: self._read_tracks(ff, video, purpose))
+
+    def _read_tracks(self, ff, video, purpose):
+        C = COLORS
+        dlg = self._dialog("Reading the video", 480, 150)
+        dlg.resizable(False, False)
+        tk.Label(dlg, text=f"Reading the subtitles of {middle_ellipsis(Path(video).name, 50)}…", font=FONTS["small"],
+                 fg=C["text"], bg=C["bg_card"], anchor="w").pack(fill="x", padx=20, pady=(18, 8))
+        bar = ttk.Progressbar(dlg, style="P.Horizontal.TProgressbar", mode="indeterminate")
+        bar.pack(fill="x", padx=20)
+        bar.start(12)
+        stop = {"cancel": False}
+        self._flat_btn(dlg, "Cancel", lambda: stop.update(cancel=True), padx=16, pady=4).pack(
+            side="bottom", anchor="e", padx=20, pady=12)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: stop.update(cancel=True))
+        self._tracks_dlg = dlg
+
+        def work():
+            try:
+                info = srt_media.probe(ff, video, timeout=60)
+                tracks = srt_media.subtitle_tracks(info)
+                files = srt_media.extract_tracks(ff, video, tracks, cancel=lambda: stop["cancel"]) if any(
+                    t["text"] for t in tracks) else {}
+                for t in tracks:
+                    t["file"] = files.get(t["index"], "")
+                    if t["file"]:
+                        try:
+                            t["lines"] = len(load_subtitle(t["file"]).blocks)
+                        except Exception:
+                            t["lines"], t["file"] = 0, ""
+                self._post(lambda: done(tracks, ""))
+            except srt_media.Cancelled:
+                self._post(lambda: done(None, "cancelled"))
+            except Exception as e:
+                err = _err(e)
+                self._post(lambda: done(None, err))
+
+        def done(tracks, error):
+            if dlg.winfo_exists():
+                dlg.destroy()
+            if error == "cancelled":
+                return
+            if error:
+                messagebox.showerror("Video", f"Cannot read the subtitles of {Path(video).name}:\n{error}",
+                                     parent=self)
+                return
+            self._show_track_picker(video, tracks, purpose)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_track_picker(self, video, tracks, purpose):
+        name = Path(video).name
+        text = [t for t in tracks if t["text"] and t.get("file")]
+        if not text:
+            pics = [t for t in tracks if not t["text"]]
+            messagebox.showinfo("No text subtitles", f"{name} has no text subtitles."
+                                + (f"\n\nIt has {len(pics)} picture subtitle(s) (PGS / VobSub): they need text "
+                                   "recognition (OCR), which is not supported." if pics else ""), parent=self)
+            return
+        best = best_track(tracks, self.source_lang.get() if purpose == "source" else "")
+        if purpose == "source" and len(text) == 1 and len(tracks) == 1:
+            self._use_track(video, text[0], "source")                  # one text track: no question
+            return
+        C = COLORS
+        dlg = self._dialog(f"Subtitles in {middle_ellipsis(name, 50)}", 860, 460)
+        dlg.minsize(self.px(620), self.px(320))
+        tk.Label(dlg, text="Pick a track. Picture subtitles (PGS / VobSub) are listed but need text recognition (OCR), "
+                           "which is not supported.", font=FONTS["small"], fg=C["text"], bg=C["bg_card"], anchor="w",
+                 justify="left", wraplength=self.px(820)).pack(fill="x", padx=16, pady=(14, 6))
+        br = tk.Frame(dlg, bg=C["bg_card"])
+        br.pack(side="bottom", fill="x", padx=16, pady=12)
+        fr = tk.Frame(dlg, bg=C["bg_card"])
+        fr.pack(fill="both", expand=True, padx=16)
+        cols = (("n", 40, "#"), ("lang", 170, "Language"), ("title", 230, "Title"), ("fmt", 90, "Format"),
+                ("flags", 120, "Flags"), ("lines", 70, "Lines"))
+        tv = ttk.Treeview(fr, columns=[c for c, _, _ in cols], show="headings", style="Subs.Treeview",
+                          selectmode="browse")
+        for c, w, t in cols:
+            tv.heading(c, text=t, anchor="w")
+            tv.column(c, width=self.px(w), stretch=c == "title", anchor="w")
+        tv.tag_configure("pic", foreground=C["text_dim"])
+        sb = ttk.Scrollbar(fr, orient="vertical", command=tv.yview, style="D.Vertical.TScrollbar")
+        tv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tv.pack(fill="both", expand=True)
+        for k, t in enumerate(tracks):
+            lang = language_name(t["language"]) or t["language"] or "–"
+            flags = ", ".join(x for x, on in (("default", t["default"]), ("forced", t["forced"]), ("SDH", t["sdh"])) if on)
+            fmt = (t["codec"] or "?").upper() if t["text"] else "picture"
+            tv.insert("", "end", iid=str(k), values=(t["n"], lang, t["title"], fmt, flags,
+                                                    t.get("lines", "") if t["text"] else "OCR needed"),
+                      tags=() if t["text"] and t.get("file") else ("pic",))
+        if best >= 0:
+            tv.selection_set(str(best))
+            tv.see(str(best))
+        note = tk.Label(br, text="", font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"])
+        note.pack(side="left")
+
+        def chosen():
+            sel = tv.selection()
+            t = tracks[int(sel[0])] if sel else None
+            if t is None or not t["text"] or not t.get("file"):
+                note.configure(text=t["note"] if t else "Pick a text track.", fg=C["warning"])
+                return None
+            return t
+
+        def act(what):
+            t = chosen()
+            if t is None:
+                return
+            if what == "save":
+                self._save_track_as(video, t)
+                return
+            dlg.destroy()
+            self._use_track(video, t, what)
+        primary = "reference" if purpose == "reference" else "source"
+        buttons = [("Save as file…", "save"), ("Use as sync reference", "reference"), ("Load and translate", "source")]
+        if purpose == "reference":
+            buttons = [("Save as file…", "save"), ("Use as sync reference", "reference")]
+        self._flat_btn(br, "Cancel", dlg.destroy, dim=True, padx=14, pady=5).pack(side="right")
+        for label, what in buttons:
+            self._flat_btn(br, label, lambda w=what: act(w), primary=what == primary, padx=14, pady=5).pack(
+                side="right", padx=(0, 6))
+        if not self.source_blocks:
+            for w in br.winfo_children():
+                if isinstance(w, tk.Button) and w.cget("text") == "Use as sync reference":
+                    w.configure(state="disabled")
+        tv.bind("<Double-Button-1>", lambda e: act(primary))
+        self._track_dlg = dlg
+        self._track_tree = tv
+
+    def _use_track(self, video, track, what):
+        label = track_display(video, track)
+        if what == "source":
+            self._load_source_file(track["file"], display=track_virtual_path(video, track),
+                                   origin={"video": video, "track": track, "label": label})
+            self._log(f"Taken from the video: {label} (the video is not changed)", "info")
+        else:
+            if not hasattr(self, "_ref_names"):
+                self._ref_names = {}
+            self._ref_names[track["file"]] = label
+            self._set_reference(track["file"])
+            self._auto = None
+            self.notebook.select(self.TAB_SYNC)
+            self._select_sync_method("auto_sub")
+
+    def _save_track_as(self, video, track):
+        target = Path(track_virtual_path(video, track))
+        out = filedialog.asksaveasfilename(title="Save the subtitle track", initialdir=str(target.parent),
+                                           initialfile=target.name, defaultextension=target.suffix,
+                                           filetypes=OPEN_FILETYPES)
+        if not out:
+            return
+        try:
+            if Path(out).exists():
+                bak = write_backup(out)
+                self._log(f"Backup written: {bak.name}", "info")
+            _atomic_write_bytes(Path(out), Path(track["file"]).read_bytes())
+            self._log(f"Track saved: {track_display(video, track)} → {out}", "success")
+            self.status_text.set(f"Track saved: {Path(out).name}")
+        except Exception as e:
+            messagebox.showerror("Save failed", f"Could not save:\n{out}\n\n{e}", parent=self)
+
+    # ── sync to the video (S4) ───────────────────────────────────────
+
+    def _set_video(self, path: str, probe: bool = True):
+        self._video_path = path or ""
+        self._video_probe, self._audio_streams = None, []
+        if not hasattr(self, "_video_label"):
+            return
+        self._video_label.configure(text=middle_ellipsis(Path(path).name, 60) if path else "none chosen",
+                                    fg=COLORS["text"] if path else COLORS["text_dim"])
+        self._video_tip.text = path or "The video this subtitle belongs to (MKV, MP4, AVI…)."
+        self._audio_combo.configure(values=[])
+        self._audio_var.set("" if not path else "(read when you press Analyse)")
+        if path and probe:
+            ff = self._ffmpeg()
+            if ff:
+                self._probe_video(ff)
+
+    def _probe_video(self, ff) -> bool:
+        try:
+            info = srt_media.probe(ff, self._video_path, timeout=30)
+        except (srt_media.MediaError, OSError) as e:
+            messagebox.showwarning("Video", f"Cannot read {Path(self._video_path).name}:\n{e}", parent=self)
+            return False
+        self._video_probe = info
+        self._audio_streams = [x for x in info["streams"] if x["type"] == "audio"]
+        labels = [audio_track_label(x, k) for k, x in enumerate(self._audio_streams)]
+        self._audio_combo.configure(values=labels)
+        if labels:
+            self._audio_combo.current(default_audio_track(self._audio_streams, self._detected_code))
+        else:
+            self._audio_var.set("no audio track")
+        fps = [x["fps"] for x in info["streams"] if x["type"] == "video" and x.get("fps")]
+        self._video_ms, self._video_fps = info.get("duration_ms"), (fps[0] if fps else None)
+        return True
+
+    def _choose_video(self):
+        start = Path(self._video_path or self.input_path or ".").parent
+        path = filedialog.askopenfilename(title="The video of this subtitle", initialdir=str(start),
+                                          filetypes=[("Videos", " ".join(f"*{e}" for e in VIDEO_EXTS)),
+                                                     ("All files", "*.*")])
+        if path:
+            self._set_video(path)
+            if self._auto is not None and self._auto.get("kind") == "video":
+                self._auto = None
+            self._sync_recompute()
+
+    def _video_analyse(self):
+        if self._sync_job is not None or not self.source_blocks or not self._video_path or self.is_translating:
+            return
+        if not _has_numpy():
+            messagebox.showwarning("Package missing", "Sync to the video needs the numpy package:\n"
+                                                      "python -m pip install numpy", parent=self)
+            return
+        self.ensure_ffmpeg("Sync to the video", lambda ff: self._video_analyse_with(ff, self.source_blocks))
+
+    def _video_analyse_with(self, ff, blocks, check_only_name=None):
+        """check_only_name: the reference subtitle is checked against the audio instead (T11)."""
+        if self._sync_job is not None or blocks is None:
+            return
+        if self._video_probe is None and not self._probe_video(ff):
+            return
+        if not self._audio_streams:
+            messagebox.showwarning("Video", f"{Path(self._video_path).name} has no audio track.", parent=self)
+            return
+        k = max(0, self._audio_combo.current())
+        stream = self._audio_streams[k]
+        track = audio_track_label(stream, k)
+        video, duration, cuts = self._video_path, self._video_probe.get("duration_ms"), self._detect_cuts.get()
+        token = object()
+        self._sync_job, self._sync_cancel = token, False
+        self._video_prog["value"] = 0
+        self._video_prog_label.configure(text="Reading the audio…")
+        self._sync_recompute()
+
+        def progress_audio(frac):
+            self._post(lambda: token is self._sync_job and (self._video_prog.configure(value=frac * 0.85),
+                                                          self._video_prog_label.configure(
+                                                              text=f"Reading the audio… {frac * 100:.0f} %")))
+
+        def progress_match(frac, text):
+            self._post(lambda: token is self._sync_job and (self._video_prog.configure(value=0.85 + frac * 0.15),
+                                                          self._video_prog_label.configure(text=text)))
+
+        def work():
+            cancel = lambda: self._sync_cancel or self._sync_job is not token      # noqa: E731
+            try:
+                ch = stream.get("channels")
+                sp = srt_media.load_cached_speech(video, stream["index"], channels=ch)
+                if sp is None:
+                    sp = srt_media.detect_speech(ff, video, stream["index"], duration, progress_audio, cancel,
+                                                 channels=ch)
+                    srt_media.save_cached_speech(video, stream["index"], sp, channels=ch)
+                res = srt_sync.match_speech(sp["times"], blocks, detect_cuts=cuts, progress=progress_match,
+                                            cancel=cancel)
+                self._post(lambda: self._video_done(token, res, sp, track, blocks, check_only_name))
+            except (srt_sync.Cancelled, srt_media.Cancelled):
+                self._post(lambda: self._video_done(token, None, None, track, blocks, check_only_name,
+                                                    "cancelled"))
+            except Exception as e:
+                err = _err(e)
+                self._post(lambda: self._video_done(token, None, None, track, blocks, check_only_name, err))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _video_done(self, token, res, sp, track, blocks, check_only_name, error=""):
+        if token is not self._sync_job:
+            return
+        self._sync_job = None
+        name = Path(self._video_path).name
+        if error == "cancelled":
+            self._log("Sync to the video cancelled; FFmpeg was stopped.", "info")
+        elif error:
+            self._log(f"Sync to the video failed: {error}", "error")
+            messagebox.showerror("Sync", f"The analysis failed:\n{error}", parent=self)
+        elif check_only_name:                  # T11: is the reference subtitle itself in sync with the audio?
+            ok = res.status == "in_sync"
+            note = ("✓ in sync with the audio" if ok else res.status_text().replace("⚠ ", "⚠ "))
+            self._refcheck_note.configure(text=note, fg=COLORS["chip_ok_fg"] if ok else COLORS["warning"])
+            self._log(f"Reference check: {check_only_name} vs the audio of {name}: {res.status_text()} "
+                      f"(confidence {res.confidence:.2f})", "success" if ok else "warn")
+            if not ok and res.status != "cannot_tell":
+                messagebox.showwarning("Reference not in sync",
+                                       f"{check_only_name} is not in sync with the audio:\n{res.status_text()}"
+                                       "\n\nSync to the video instead, or fix the reference first.", parent=self)
+        elif blocks is self.source_blocks:
+            self._auto = {"res": res, "ref_path": self._video_path, "ref_blocks": None, "kind": "video",
+                          "ref_times": [tuple(x) for x in sp["times"]], "ref_starts": [x[0] for x in sp["times"]],
+                          "blocks": blocks, "track": track, "detector": sp["detector"], "channel": sp.get("channel")}
+            self._sync_check = (res, name, blocks)
+            src = "cached" if sp.get("cached") else f"{sp['detector']}, {sp['elapsed']:.0f} s"
+            self._log(f"Sync to the video: {res.status_text(name)} — confidence {res.confidence:.2f} "
+                      f"(speech: {src}; match {res.elapsed:.1f} s)", "success" if res.status == "in_sync" else "warn")
+            self._prefill_fine_tune(res)
+        self._update_sync_row()
+        self._sync_recompute()
+
+    def _check_reference_audio(self):
+        """T11: test the reference subtitle against the video's audio before trusting it."""
+        if not self._ref_path or not self._video_path or self._sync_job is not None:
+            return
+        ref = self._read_doc(self._ref_path, "the reference")
+        if ref:
+            self._refcheck_note.configure(text="checking…", fg=COLORS["text_dim"])
+            self.ensure_ffmpeg("Checking the reference against the video",
+                               lambda ff: self._video_analyse_with(ff, ref.blocks, Path(self._ref_path).name))
+
+    # ── Check a folder (S2) ──────────────────────────────────────────
+
+    def _check_folder(self, folder: str = None):
+        if self._sync_job is not None or not self.source_blocks:
+            return
+        if not _has_numpy():
+            messagebox.showwarning("Package missing", "Checking needs the numpy package:\npython -m pip install numpy",
+                                   parent=self)
+            return
+        if folder is None:
+            folder = filedialog.askdirectory(title="Folder with subtitles to check",
+                                             initialdir=str(Path(self.input_path).parent))
+        if not folder:
+            return
+        paths = [str(q) for q in sorted(Path(folder).iterdir()) if q.is_file() and q.suffix.lower() in TEXT_FORMATS
+                 and not same_file(str(q), self.input_path) and not picture_subtitle_reason(str(q))]
+        if not paths:
+            messagebox.showinfo("Check a folder", "There are no other subtitles in this folder.", parent=self)
+            return
+        ref_blocks, ref_name = self.source_blocks, Path(self.input_path).name
+        token = object()
+        self._sync_job, self._sync_cancel = token, False
+        self._sync_recompute()
+
+        def progress(k, n, name):
+            self._post(lambda: token is self._sync_job and self._folder_status.configure(
+                text=f"{k + 1} of {n}: {middle_ellipsis(name, 40)}"))
+
+        def work():
+            try:
+                rows = folder_check_rows(ref_blocks, paths, progress,
+                                         cancel=lambda: self._sync_cancel or self._sync_job is not token)
+                self._post(lambda: self._folder_done(token, ref_name, rows))
+            except srt_sync.Cancelled:
+                self._post(lambda: self._folder_done(token, ref_name, None))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _folder_done(self, token, ref_name, rows):
+        if token is not self._sync_job:
+            return
+        self._sync_job = None
+        self._folder_status.configure(text="" if rows is not None else "cancelled")
+        self._sync_recompute()
+        if rows is None:
+            return
+        self._folder_rows = rows
+        self._log(f"Folder check against {ref_name}: {len(rows)} file(s)", "info")
+        for r in rows:
+            self._log(f"  {Path(r['file']).name}: {r['text']}", "info")
+        self._show_folder_report(ref_name, rows)
+
+    def _show_folder_report(self, ref_name, rows):
+        C = COLORS
+        dlg = self._dialog("Sync check of a folder", 940, 480)
+        dlg.minsize(self.px(640), self.px(320))
+        tk.Label(dlg, text=f"Compared with {ref_name} (timing only). Nothing was changed.", font=FONTS["small"],
+                 fg=C["text"], bg=C["bg_card"], anchor="w").pack(fill="x", padx=16, pady=(14, 6))
+        br = tk.Frame(dlg, bg=C["bg_card"])
+        br.pack(side="bottom", fill="x", padx=16, pady=12)
+        fr = tk.Frame(dlg, bg=C["bg_card"])
+        fr.pack(fill="both", expand=True, padx=16)
+        cols = (("file", 330, "File"), ("status", 330, "Status"), ("conf", 80, "Confidence"),
+                ("overlap", 170, "Overlap before → after"))
+        tv = ttk.Treeview(fr, columns=[c for c, _, _ in cols], show="headings", style="Subs.Treeview")
+        for c, w, t in cols:
+            tv.heading(c, text=t, anchor="w")
+            tv.column(c, width=self.px(w), stretch=c in ("file", "status"), anchor="w")
+        sb = ttk.Scrollbar(fr, orient="vertical", command=tv.yview, style="D.Vertical.TScrollbar")
+        tv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tv.pack(fill="both", expand=True)
+        for r in rows:
+            res = r["res"]
+            tv.insert("", "end", values=(Path(r["file"]).name, r["text"], f"{res.confidence:.2f}" if res else "",
+                                         f"{res.overlap_before:.2f} → {res.overlap_after:.2f}" if res else ""))
+        text = folder_report_text(ref_name, rows)
+
+        def save():
+            out = filedialog.asksaveasfilename(title="Save the folder report", defaultextension=".md",
+                                               initialfile="sync_check_report.md",
+                                               filetypes=[("Markdown", "*.md"), ("Text files", "*.txt")])
+            if out:
+                try:
+                    _atomic_write_text(Path(out), text)
+                    self._log(f"Folder report saved: {out}", "info")
+                except Exception as e:
+                    messagebox.showerror("Save failed", str(e), parent=dlg)
+        self._flat_btn(br, "Close", dlg.destroy, primary=True, padx=18, pady=5).pack(side="right")
+        self._flat_btn(br, "Save report…", save, padx=12, pady=5).pack(side="right", padx=(0, 6))
+        self._flat_btn(br, "Copy report", lambda: self._copy_text(text, "Report copied"), padx=12,
+                       pady=5).pack(side="right", padx=(0, 6))
+        self._folder_dlg = dlg
+
+    def _clear_translation_for_sync(self, what: str) -> bool:
+        """A translation in the table was made with the old times: confirm, then clear it. False = cancelled."""
+        if not (self._tr_lines or self.translated_blocks):
+            return True
+        if not messagebox.askokcancel(
+                what, "The translation in the table was made with the old times. It is cleared from the table "
+                      "(files already saved are not changed); translate again afterwards.\n\nContinue?",
+                parent=self):
+            return False
+        self._tr_lines, self._flags, self.translated_blocks, self.qc_issues = {}, {}, [], []
+        self._show_open_link(False)
+        return True
+
+    def _sync_apply(self):
+        if self.is_translating or not self._sync_pending or self._sync_pending[0].is_identity:
+            return
+        if not self._clear_translation_for_sync("Apply sync"):
+            return
+        tmap = self._sync_pending[0]
+        auto = self._auto_valid(self._sync_method) if self._sync_method in ("auto_sub", "auto_video") else None
+        if auto is not None and auto["res"].low_confidence and not messagebox.askokcancel(
+                "Low confidence", f"The match has a low confidence ({auto['res'].confidence:.2f}). Check the "
+                                  "preview: do the reference lines meet the right lines?\n\nApply anyway?",
+                icon="warning", parent=self):
+            return                       # X1: nothing changes until the user confirms
+        doc = self.doc
+        if self._sync_snapshot is None:
+            self._sync_snapshot = {"blocks": self.source_blocks, "removed": set(doc.removed_events),
+                                   "problems": list(self.problems), "repair_log": list(self._repair_log)}
+        old = self.source_blocks
+        res = sync_doc_blocks(doc, old, tmap)
+        self.source_blocks = res.blocks
+        doc.blocks = res.blocks
+        self._sync_info = self._sync_report_info(tmap, res, old, auto)
+        msg = f"Sync applied: {tmap.label} — {res.moved:,} block(s) moved"
+        if res.dropped:
+            msg += f", {len(res.dropped)} dropped (ended before 0:00)"
+        if res.clamped:
+            msg += f", {len(res.clamped)} clamped at 0:00"
+        self._log(msg + ". The file on disk is unchanged.", "success")
+        self._sync_set_defaults()
+        self._update_file_info()
+        self._fill_table()
+        self._refresh_cost()
+        self._sync_recompute()
+        self.status_text.set(f"Synced in the app ({tmap.label}). Translate it, or Save synced copy… on the Sync tab")
+
+    def _sync_undo(self):
+        snap = self._sync_snapshot
+        if snap is None or self.is_translating:
+            return
+        if not self._clear_translation_for_sync("Undo sync"):
+            return
+        doc = self.doc
+        self.source_blocks = snap["blocks"]
+        doc.blocks = snap["blocks"]
+        doc.removed_events = set(snap["removed"])
+        doc.time_maps, doc.sync_dropped = [], set()
+        self.problems, self._repair_log = snap["problems"], snap["repair_log"]
+        self._sync_snapshot = None
+        self._sync_info = None
+        self._log("Sync undone: the original times are back.", "info")
+        self._sync_set_defaults()
+        self._update_file_info()
+        self._fill_table()
+        self._refresh_cost()
+        self._sync_recompute()
+        self.status_text.set("Sync undone: the original times are back")
+
+    def _sync_report_info(self, tmap, res, old_blocks, auto=None) -> dict:
+        doc = self.doc
+        ratio_line = (f"Speed: {tmap.ratio:.5f} ({srt_sync.describe_ratio(tmap.ratio)})" if tmap.is_linear
+                      else f"Segments: {len(tmap.segments)}")
+        idx = srt_sync.dialogue_indexes(old_blocks)
+        t0 = timestamp_ms(old_blocks[idx[0]]["timestamp"])[0] if idx else 0
+        lang = _LANG_LABEL.get(self._detected_code, "language not detected")
+        return {
+            "file": self.input_path, "format": doc.label, "encoding": self._enc_short, "language": lang,
+            "blocks": len(old_blocks), "method": SYNC_METHOD_NAMES.get(tmap.kind, tmap.kind),
+            "result": [tmap.label, f"Offset at the first line: {srt_sync.fmt_offset(tmap.offset_at(t0))}",
+                       ratio_line],
+            "moved": res.moved,
+            "clamped": [(timestamp_ms(old_blocks[i]["timestamp"])[0], srt_sync.first_words(old_blocks[i]))
+                        for i in res.clamped],
+            "dropped": [(timestamp_ms(old_blocks[i]["timestamp"])[0], srt_sync.first_words(old_blocks[i]))
+                        for i in res.dropped],
+            "ads_removed": sum(1 for line in self._repair_log if "ad" in line.lower() and "remov" in line.lower()),
+            "sample": srt_sync.sample_for_report(old_blocks, res),
+            "output": "", "backup": "", "app_version": APP_VERSION,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        } if auto is None else self._auto_report_info(tmap, res, old_blocks, auto, lang)
+
+    def _auto_report_info(self, tmap, res, old_blocks, auto, lang) -> dict:
+        m = auto["res"]
+        if auto.get("kind") == "video":
+            reference = (f"{Path(auto['ref_path']).name}, {auto.get('track', 'audio')} · speech: {auto.get('detector')}"
+                         f"{' (centre channel)' if auto.get('channel') == 'center' else ''}")
+            notes = [f"{srt_sync.fmt_ms(a)[:8]}–{srt_sync.fmt_ms(b)[:8]}: speech but no subtitle — this scene is "
+                     "probably not in the subtitle's version" for a, b in m.ref_gaps]
+        else:
+            ref_lang = _LANG_LABEL.get(detect_language(auto["ref_blocks"]), "language not detected")
+            reference = f"{self._ref_name(auto['ref_path'])} ({auto.get('ref_label', '')}, {ref_lang})"
+            notes = [f"Reference text with no line in this subtitle: {srt_sync.fmt_ms(a)[:8]}–"
+                     f"{srt_sync.fmt_ms(b)[:8]} (probably a scene that is not in this version)" for a, b in m.ref_gaps]
+        return {
+            "file": self.input_path, "format": self.doc.label, "encoding": self._enc_short, "language": lang,
+            "blocks": len(old_blocks), "method": "To the video" if auto.get("kind") == "video" else
+            "To another subtitle", "reference": reference,
+            "result": [m.status_text(), tmap.label, f"Speed: {m.ratio:.5f} ({srt_sync.describe_ratio(m.ratio)})"],
+            "segments": [(g["from_ms"], g["to_ms"], g["offset_ms"]) for g in m.segments] if len(m.segments) > 1
+            else [],
+            "confidence": m.confidence, "overlap": (m.overlap_before, m.overlap_after),
+            "moved": res.moved,
+            "clamped": [(timestamp_ms(old_blocks[i]["timestamp"])[0], srt_sync.first_words(old_blocks[i]))
+                        for i in res.clamped],
+            "dropped": [(timestamp_ms(old_blocks[i]["timestamp"])[0], srt_sync.first_words(old_blocks[i]))
+                        for i in res.dropped],
+            "unmatched": [(timestamp_ms(old_blocks[i]["timestamp"])[0], srt_sync.first_words(old_blocks[i]))
+                          for i in m.unmatched if i < len(old_blocks)],
+            "notes": notes,
+            "ads_removed": sum(1 for line in self._repair_log if "ad" in line.lower() and "remov" in line.lower()),
+            "sample": srt_sync.sample_for_report(old_blocks, res),
+            "output": "", "backup": "", "app_version": APP_VERSION,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+
+    def _sync_report_text(self) -> str:
+        return srt_sync.build_report(self._sync_info) if self._sync_info else ""
+
+    def _show_sync_report(self):
+        text = self._sync_report_text()
+        if not text:
+            return
+        C = COLORS
+        dlg = self._dialog("Sync report", 720, 560)
+        dlg.minsize(self.px(480), self.px(320))
+        br = tk.Frame(dlg, bg=C["bg_card"])
+        br.pack(side="bottom", fill="x", padx=16, pady=12)
+        txt = scrolledtext.ScrolledText(dlg, font=FONTS["mono_sm"], bg=C["bg_dark"], fg=C["text"], relief="flat",
+                                        wrap="none", padx=14, pady=12, highlightthickness=0)
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        self._flat_btn(br, "Close", dlg.destroy, primary=True, padx=18, pady=5).pack(side="right")
+        self._flat_btn(br, "Save as .txt…", self._save_sync_report, padx=12, pady=5).pack(side="right", padx=(0, 6))
+        self._flat_btn(br, "Copy", lambda: self._copy_text(text, "Report copied"), padx=12,
+                       pady=5).pack(side="right", padx=(0, 6))
+        self._sync_report_dlg = dlg
+
+    def _save_sync_report(self):
+        text = self._sync_report_text()
+        if not text:
+            return
+        stem = Path(self.input_path).stem if self.input_path else "subtitle"
+        out = filedialog.asksaveasfilename(title="Save sync report", defaultextension=".txt",
+                                           initialfile=f"{stem}.sync-report.txt",
+                                           initialdir=str(Path(self.input_path).parent) if self.input_path else "",
+                                           filetypes=[("Text files", "*.txt")])
+        if not out:
+            return
+        try:
+            _atomic_write_text(Path(out), text)
+            self._log(f"Sync report saved: {out}", "info")
+            self.status_text.set(f"Sync report saved: {Path(out).name}")
+        except Exception as e:
+            messagebox.showerror("Save failed", f"Could not save:\n{out}\n\n{e}")
+
+    def _sync_save_copy(self, out: str = None):
+        """Save the synced subtitle. out=None asks with a Save dialog pre-filled with the original name."""
+        doc = self.doc
+        if doc is None or not doc.time_maps or self.is_translating:
+            return
+        src = Path(self.input_path)
+        if out is None:
+            out = filedialog.asksaveasfilename(title="Save synced subtitle", initialfile=src.name,
+                                               initialdir=str(src.parent), defaultextension=src.suffix,
+                                               filetypes=OPEN_FILETYPES)
+        if not out:
+            return
+        try:
+            bak = None
+            if same_file(out, self.input_path):
+                bak = write_backup(src)
+                self._log(f"Backup written: {bak.name}", "info")
+            text = render_subtitle(doc, self.source_blocks, "same")
+            enc, note = output_encoding_for(self.output_enc.get(), doc.encoding, text, doc.is_srt)
+            if not doc.is_srt and enc == "utf-8-sig" and self.output_enc.get() == "utf-8-sig":
+                enc = "utf-8"            # BOM only for SRT, as for translations
+            write_subtitle_text(text, out, enc)
+        except Exception as e:
+            messagebox.showerror("Save failed", f"Could not save:\n{out}\n\n{e}")
+            return
+        if note:
+            self._log(note, "warn")
+        if self._sync_info:
+            self._sync_info["output"] = out
+            self._sync_info["backup"] = str(bak) if bak else ""
+            self._sync_info["date"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self._log(f"Synced copy saved: {out}" + (f"  (backup: {bak.name})" if bak else ""), "success")
+        self.status_text.set(f"Synced copy saved: {Path(out).name}")
+        self._last_saved = out
+        self._show_open_link(True)
+        self._show_sync_report()
+
+    # FFMPEG ON DEMAND (v0.10.0 · S3) ───────────────────────────────
+    def _ffmpeg(self):
+        """{"ffmpeg", "ffprobe", "source"} or None. Never downloads."""
+        return srt_media.find_ffmpeg(self._ffmpeg_path)
+
+    def _update_ff_status(self):
+        if not getattr(self, "_ff_status", None) or not self._ff_status.winfo_exists():
+            return
+        ff = self._ffmpeg()
+        where = {"settings": "chosen file", "downloaded": "downloaded by the app", "path": "on the PATH"}
+        if ff:
+            self._ff_status.configure(text=f"✓ Found ({where[ff['source']]}): {middle_ellipsis(ff['ffmpeg'], 60)}",
+                                      fg=COLORS["success"])
+            self._ff_tip.text = ff["ffmpeg"]
+        else:
+            self._ff_status.configure(text="Not found. Download it or choose ffmpeg.exe.", fg=COLORS["text_dim"])
+            self._ff_tip.text = ""
+
+    def _choose_ffmpeg(self, then=None):
+        path = filedialog.askopenfilename(title="Choose ffmpeg.exe (ffprobe.exe must be next to it)",
+                                          filetypes=[("ffmpeg", "ffmpeg.exe ffmpeg"), ("All files", "*.*")])
+        if not path:
+            return None
+        ff = srt_media.find_ffmpeg(path, tools_dir=Path(path).parent / "__no_download__", path_env="")
+        if not ff:
+            messagebox.showwarning("FFmpeg", "ffprobe.exe must be in the same folder as ffmpeg.exe.", parent=self)
+            return None
+        try:
+            ver = srt_media.ffmpeg_version(ff)
+        except srt_media.MediaError as e:
+            messagebox.showwarning("FFmpeg", str(e), parent=self)
+            return None
+        self._ffmpeg_path = ff["ffmpeg"]
+        save_config({"ffmpeg_path": self._ffmpeg_path})
+        self._log(f"FFmpeg chosen: {ff['ffmpeg']} — {ver}", "info")
+        self._update_ff_status()
+        if then:
+            then(ff)
+        return ff
+
+    def ensure_ffmpeg(self, why: str, then):
+        """Call then(ff) with FFmpeg; if it is missing, ask first: download it (about 81 MB), choose one, or cancel."""
+        ff = self._ffmpeg()
+        if ff:
+            then(ff)
+            return
+        size = srt_media.FFMPEG_SIZE / 1e6
+        self._ff_ask = self._message_dialog(
+            "Video tools needed", f"{why} needs FFmpeg", [
+                ("What", "FFmpeg, the free video toolkit (LGPL licence), build " + srt_media.FFMPEG_BUILD, COLORS["text"]),
+                ("Download", f"about {size:.0f} MB, about {size * 2.1:.0f} MB on disk, once", COLORS["text"]),
+                ("Saved in", str(srt_media.TOOLS_DIR), COLORS["text_dim"]),
+                ("Already have it?", "Choose ffmpeg.exe (ffprobe.exe must be next to it)", COLORS["text_dim"])],
+            [("Cancel", lambda: None, False), ("Choose ffmpeg.exe…", lambda: self._choose_ffmpeg(then), False),
+             ("Download", lambda: self._download_ffmpeg(then), True)], w=640)
+
+    def _download_ffmpeg(self, then):
+        """The download in a worker thread with a progress bar and Cancel; nothing is kept on a failure."""
+        if getattr(self, "_ff_job", None):
+            return
+        C = COLORS
+        dlg = self._dialog("Downloading FFmpeg", 520, 170)
+        dlg.resizable(False, False)
+        tk.Label(dlg, text=f"FFmpeg {srt_media.FFMPEG_BUILD}", font=FONTS["small"], fg=C["text"], bg=C["bg_card"],
+                 anchor="w").pack(fill="x", padx=20, pady=(16, 6))
+        bar = ttk.Progressbar(dlg, style="P.Horizontal.TProgressbar", mode="determinate", maximum=1.0)
+        bar.pack(fill="x", padx=20)
+        lab = tk.Label(dlg, text="Starting…", font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"], anchor="w")
+        lab.pack(fill="x", padx=20, pady=(6, 0))
+        token = {"cancel": False}
+        self._ff_job = token
+        self._ff_dlg = dlg
+
+        def cancel():
+            token["cancel"] = True
+            lab.configure(text="Cancelling…")
+        btn = self._flat_btn(dlg, "Cancel", cancel, padx=16, pady=4)
+        btn.pack(side="bottom", anchor="e", padx=20, pady=12)
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
+
+        def progress(done, total):
+            self._post(lambda: dlg.winfo_exists() and (bar.configure(value=done / total if total else 0),
+                                                        lab.configure(text=f"{done / 1e6:.1f} of {total / 1e6:.1f} MB")))
+
+        def work():
+            try:
+                ff = srt_media.download_ffmpeg(progress=progress, cancel=lambda: token["cancel"])
+                self._post(lambda: finish(ff, ""))
+            except srt_media.Cancelled:
+                self._post(lambda: finish(None, "cancelled"))
+            except Exception as e:
+                err = _err(e)
+                self._post(lambda: finish(None, err))
+
+        def finish(ff, error):
+            self._ff_job = None
+            if dlg.winfo_exists():
+                dlg.destroy()
+            self._update_ff_status()
+            if error == "cancelled":
+                self._log("FFmpeg download cancelled; nothing was kept.", "info")
+            elif error:
+                self._log(f"FFmpeg download failed: {error}", "error")
+                messagebox.showerror("FFmpeg", f"The download failed; nothing was kept.\n\n{error}", parent=self)
+            else:
+                self._log(f"FFmpeg downloaded to {srt_media.TOOLS_DIR}", "success")
+                then(ff)
+        threading.Thread(target=work, daemon=True).start()
+
     # STATUS BAR ──────────────────────────────────────────────────────
     def _build_statusbar(self):
         C = COLORS
@@ -3753,7 +5867,7 @@ class App(tk.Tk):
         self.bind_all("<Control-o>", lambda e: self._browse())
         self.bind_all("<Control-Return>", lambda e: self._start(sample=False))
         self.bind_all("<Escape>", lambda e: self._cancel() if self.is_translating else None)
-        for i in range(3):
+        for i in range(4):
             self.bind_all(f"<Control-Key-{i + 1}>", lambda e, k=i: self.notebook.select(k))
         self.bind_all("<Control-s>", lambda e: self._save_log() if self._current_tab_name() == "log" else None)
         self.bind_all("<F1>", lambda e: self._show_help())
@@ -4055,6 +6169,23 @@ class App(tk.Tk):
         Tooltip(c, "Asks GitHub for the latest release. Nothing else is sent. A newer version shows a link "
                    "in the status bar; nothing is downloaded or installed.")
         self._link(urow, "Check now", lambda: self._check_for_updates(manual=True)).pack(side="right", padx=20)
+        self._section(p, "VIDEO TOOLS (FFMPEG)")
+        frow = tk.Frame(p, bg=C["bg_card"])
+        frow.pack(fill="x", padx=20)
+        self._ff_status = tk.Label(frow, text="", font=FONTS["small"], fg=C["text"], bg=C["bg_card"], anchor="w")
+        self._ff_status.pack(side="left", fill="x", expand=True)
+        self._ff_tip = Tooltip(self._ff_status, "")
+        frow2 = tk.Frame(p, bg=C["bg_card"])
+        frow2.pack(fill="x", padx=20, pady=(4, 0))
+        self._link(frow2, "Choose ffmpeg.exe…", self._choose_ffmpeg, font=FONTS["small"]).pack(side="left")
+        self._link(frow2, f"Download (about {srt_media.FFMPEG_SIZE / 1e6:.0f} MB)…",
+                   lambda: self._download_ffmpeg(lambda ff: None), font=FONTS["small"]).pack(side="left", padx=(16, 0))
+        self._link(frow2, "Check", self._update_ff_status, font=FONTS["small"]).pack(side="left", padx=(16, 0))
+        tk.Label(p, text="Needed for sync to the video and for subtitles inside MKV/MP4. Looked for in this order: "
+                         "the file chosen here, the app's download folder, the PATH.",
+                 font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"], anchor="w", justify="left",
+                 wraplength=self.px(560)).pack(fill="x", padx=20, pady=(4, 0))
+        self._update_ff_status()
 
         # OUTPUT
         p = page("Output")
@@ -4069,6 +6200,10 @@ class App(tk.Tk):
                          "when the source encoding cannot hold the translated text (e.g. Thai into cp1252).",
                  font=FONTS["tiny"], fg=C["text_dim"], bg=C["bg_card"], anchor="w", justify="left",
                  wraplength=self.px(560)).pack(fill="x", padx=20, pady=(2, 0))
+        self._section(p, "SYNC CHECK")
+        self._check(p, "Check the timing when a subtitle is opened", self.sync_check_on_load,
+                    "Compares it with the context file or with another subtitle of the same film next to it\n"
+                    "(Movie.pt.srt for Movie.en.srt). It only reports; it never changes anything.")
         self._section(p, "AI NOTICE")
         self._check(p, "Add a 'translated by AI' line to the subtitle", self.notice_on)
         r = tk.Frame(p, bg=C["bg_card"])
@@ -4463,7 +6598,8 @@ class App(tk.Tk):
     # ── File handling ────────────────────────────────────────────────
 
     def _browse(self):
-        path = filedialog.askopenfilename(title="Open subtitle", filetypes=OPEN_FILETYPES)
+        path = filedialog.askopenfilename(title="Open a subtitle (or a video with subtitles inside)",
+                                          filetypes=OPEN_ANY_FILETYPES)
         if path:
             self._load_source_file(path)
 
@@ -4478,7 +6614,7 @@ class App(tk.Tk):
 
     def _on_drop(self, path: str):
         p = Path(path)
-        if p.suffix.lower() in TEXT_FORMATS or p.suffix.lower() in PICTURE_EXTS:
+        if p.suffix.lower() in TEXT_FORMATS or p.suffix.lower() in PICTURE_EXTS or p.suffix.lower() in OPEN_VIDEO_EXTS:
             self._load_source_file(str(p))
         else:
             messagebox.showwarning("Not a subtitle", f"{p.name} is not a subtitle file the app can open.\n\n"
@@ -4539,16 +6675,22 @@ class App(tk.Tk):
             self._save_glossary_sidecar()
         return True
 
-    def _load_source_file(self, path: str):
+    def _load_source_file(self, path: str, display: str = None, origin: dict = None):
+        """display/origin (S5): a track taken from a video, read from `path` (the extracted copy) but named as
+        if it sat next to the video (`display`); origin = {"video", "track", "label"}."""
         if self.is_translating:
             messagebox.showwarning("Translation running", "Wait for the translation to finish (or cancel it) "
                                                           "before loading another subtitle.")
             return
         path = str(path).strip()
+        if origin is None and Path(path).suffix.lower() in OPEN_VIDEO_EXTS:
+            self._open_video(path, "source")
+            return
         doc = self._read_doc(path, "the file")
         if not doc:
             return
-        if not same_file(path, self.input_path):
+        shown = display or path
+        if not same_file(shown, self.input_path):
             if not self._confirm_names_switch():
                 return
             self._cols_user = False              # v0.9.1 (X7): automatic column widths again for a new file
@@ -4560,7 +6702,8 @@ class App(tk.Tk):
         self.source_blocks = doc.blocks
         self.translated_blocks, self._tr_lines, self._flags, self.qc_issues = [], {}, {}, []
         self._repair_log = []
-        self.input_path = path
+        self.input_path = shown
+        self._origin = origin
         self._enc_short = doc.encoding.upper().replace("-SIG", "+BOM")
         self._detected_code = detect_language(doc.blocks)
         self.problems = check_subtitle(doc, self._ad_extra, is_srt=doc.is_srt, parse_problems=doc.problems)
@@ -4568,20 +6711,22 @@ class App(tk.Tk):
         self.batch_size.set(sug)
         if self._detected_code:
             self._set_src_combo(self._detected_code)
-        self._recent = push_recent(self._recent, path)
+        self._recent = push_recent(self._recent, origin["video"] if origin else path)
         save_config({"recent_files": self._recent})
         self._show_open_link(False)
         self._last_cost_lbl.configure(text="")
         self._update_file_info()
+        self._sync_reset()
         n_cues = sum(1 for b in doc.blocks for l in b["text_lines"] if is_cue(l))
-        self._log(f"Loaded: {Path(path).name} — {doc.label}, {len(doc.blocks):,} blocks  [{self._enc_short}]  •  "
+        what = origin["label"] if origin else Path(path).name
+        self._log(f"Loaded: {what} — {doc.label}, {len(doc.blocks):,} blocks  [{self._enc_short}]  •  "
                   f"{n_cues} cue lines", "accent")
         lang = _LANG_LABEL.get(self._detected_code, "not detected (pick it in LANGUAGES)")
         self._log(f"Detected: {lang}  •  auto batch={sug}", "info" if self._detected_code else "warn")
         if self.problems:
             self._log(f"Source check: {len(self.problems)} problem(s) — see Repair › Review…", "warn")
 
-        sidecar = glossary_sidecar_path(path)
+        sidecar = glossary_sidecar_path(shown)
         if sidecar.exists():
             try:
                 n = self._merge_glossary(parse_glossary(sidecar.read_text(encoding="utf-8")))
@@ -4590,7 +6735,7 @@ class App(tk.Tk):
             except Exception as e:
                 self._log(f"Could not read {sidecar.name}: {e}", "warn")
         elif not self._glossary_terms():
-            restored = parse_glossary(saved_names_for(self._saved_glossary, path))
+            restored = parse_glossary(saved_names_for(self._saved_glossary, shown))
             if restored:
                 self._merge_glossary(restored)
                 self._gloss_status.configure(text=f"Restored {len(restored)} names from the last session")
@@ -4622,17 +6767,26 @@ class App(tk.Tk):
         if not self.source_blocks:
             return
         self.file_label.configure(fg=C["text_bright"])
-        self._file_tip.text = f"{self.input_path}\n\nClick to open another subtitle."
+        origin = getattr(self, "_origin", None)
+        self._file_tip.text = (f"{origin['label']}\nRead from the video (the video is never changed). Saved files go "
+                               f"next to it.\n\nClick to open another subtitle." if origin else
+                               f"{self.input_path}\n\nClick to open another subtitle.")
         self._update_file_label()
         for w in self._chips.winfo_children():
             w.destroy()
         lang = _LANG_LABEL.get(self._detected_code)
-        for text, kind in ((self.doc.label, ""), (self._enc_short, ""), (f"{len(self.source_blocks):,} blocks", ""),
-                           (lang.split(" — ")[0] if lang else "language ?", "" if lang else "warn")):
+        chips = [(self.doc.label, ""), (self._enc_short, ""), (f"{len(self.source_blocks):,} blocks", ""),
+                 (lang.split(" — ")[0] if lang else "language ?", "" if lang else "warn")]
+        if origin:
+            chips.insert(0, (f"from {Path(origin['video']).suffix.lstrip('.').upper()} · track {origin['track']['n']}",
+                             "ok"))
+        for text, kind in chips:
             self._chip(self._chips, text, kind).pack(side="left", padx=(0, 6))
         self._hint.pack_forget()
-        self._repair_row.pack(fill="x", pady=(8, 0), after=self._chips)
+        self._sync_row.pack(fill="x", pady=(8, 0), after=self._chips)
+        self._repair_row.pack(fill="x", pady=(4, 0), after=self._sync_row)
         self._ctx_row.pack(fill="x", pady=(4, 0), after=self._repair_row)
+        self._update_sync_row()
         self._update_repair_row()
         self._update_output_line()
 
@@ -4753,10 +6907,7 @@ class App(tk.Tk):
             return
         try:
             if same_file(out, self.input_path):
-                bak = next(src.with_name(src.name + (".bak" if k == 1 else f".bak{k}"))
-                           for k in range(1, 1000)
-                           if not src.with_name(src.name + (".bak" if k == 1 else f".bak{k}")).exists())
-                bak.write_bytes(src.read_bytes())
+                bak = write_backup(src)
                 self._log(f"Backup written: {bak.name}", "info")
             text = render_subtitle(doc, self.source_blocks, "same")
             enc, note = output_encoding_for(self.output_enc.get(), doc.encoding, text, doc.is_srt)
